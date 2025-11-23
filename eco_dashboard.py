@@ -20,7 +20,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # 初始化DeepSeek客户端
 deepseek_client = openai.OpenAI(
     base_url="https://api.deepseek.com",
-    api_key="sk-ce7cb4a9e8ad40fd97392a86379e41e5"  # DeepSeek API密钥
+    api_key="yourkey"  # DeepSeek API密钥
 )
 
 class EcoSystem:
