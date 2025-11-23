@@ -1,390 +1,2792 @@
-# eco_dashboard.py
-from flask import Flask, render_template, jsonify, request
-from flask_socketio import SocketIO, emit
-import threading
-import time
-import random
-from datetime import datetime
-import openai
-import os
-import requests
-from dotenv import load_dotenv
-
-# 加载环境变量
-load_dotenv()
-
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, cors_allowed_origins="*")
-
-# 初始化DeepSeek客户端
-deepseek_client = openai.OpenAI(
-    base_url="https://api.deepseek.com",
-    api_key="sk-ce7cb4a9e8ad40fd97392a86379e41e5"  # DeepSeek API密钥
-)
-
-class EcoSystem:
-    def __init__(self):
-        self.temperature = 25.5
-        self.humidity = 65
-        self.light_level = 850
-        self.weather_condition = "晴"
-        self.weather_temperature = 22.0
-        self.weather_humidity = 60
-        self.weather_city = "宁波"
-        self.ventilation_active = False
-        self.ventilation_speed = 0
-        self.lighting_active = False
-        self.lighting_brightness = 0
-        self.running = True
-        self.chat_history = []  # 存储聊天历史
-        self.last_weather_update = None  # 记录上次天气更新的时间
-        
-        # 回调函数
-        self.ventilation_callback = None
-        self.lighting_callback = None
-        self.data_update_callback = None
-    
-    def start_background_thread(self):
-        """启动后台数据更新线程"""
-        def update_data():
-            while self.running:
-                # 降低天气API调用频率，每10分钟更新一次
-                if not self.last_weather_update or (datetime.now() - self.last_weather_update).total_seconds() > 600:
-                    weather_data = self.get_weather_data()
-                    if weather_data:
-                        self.weather_condition = weather_data.get('condition', self.weather_condition)
-                        self.weather_temperature = weather_data.get('temperature', self.weather_temperature)
-                        self.weather_humidity = weather_data.get('humidity', self.weather_humidity)
-                        self.weather_city = weather_data.get('city', self.weather_city)
-                        self.last_weather_update = datetime.now()
-                
-                # 广播数据更新
-                socketio.emit('sensor_data', {
-                    'temperature': round(self.temperature, 1),
-                    'humidity': round(self.humidity, 1),
-                    'light_level': round(self.light_level, 1),
-                    'weather_condition': self.weather_condition,
-                    'weather_temperature': round(self.weather_temperature, 1),
-                    'weather_humidity': round(self.weather_humidity, 1),
-                    'weather_city': self.weather_city,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                })
-                
-                time.sleep(1)  # 每秒更新
-        
-        thread = threading.Thread(target=update_data, daemon=True)
-        thread.start()
-    
-    def get_weather_data(self):
-        """获取宁波市天气数据"""
-        try:
-            # 高德地图API参数
-            url = "https://restapi.amap.com/v3/weather/weatherInfo"
-            params = {
-                "key": "e43316c9feea1a2537aa004df7921c9e",  # 高德地图API密钥
-                "city": "330201",  # 宁波市市辖区adcode
-                "extensions": "base",  # base=实况天气
-                "output": "JSON"
-            }
-            
-            response = requests.get(url, params=params, timeout=5)
-            data = response.json()
-            
-            if data.get("status") == "1" and isinstance(data.get("lives"), list) and len(data["lives"]) > 0:
-                live = data["lives"][0]  # 确保正确访问列表中的第一个元素
-                return {
-                    'condition': live.get('weather', '未知'),
-                    'temperature': float(live.get('temperature', 22.0)),
-                    'humidity': int(live.get('humidity', 60)),
-                    'city': live.get('city', '未知'),
-                    'reporttime': live.get('reporttime', '')
-                }
-            else:
-                print("天气API返回错误:", data.get("info", "未知错误"))
-                return None
-                
-        except Exception as e:
-            print(f"获取天气数据失败: {e}")
-            # 返回模拟数据，确保系统继续运行
-            return {
-                'condition': "多云",
-                'temperature': 18,
-                'humidity': 68,
-                'city': "宁波"
-            }
-    
-    def set_ventilation_callback(self, callback):
-        """设置通风控制回调"""
-        self.ventilation_callback = callback
-    
-    def set_lighting_callback(self, callback):
-        """设置照明控制回调"""
-        self.lighting_callback = callback
-    
-    def set_data_update_callback(self, callback):
-        """设置数据更新回调"""
-        self.data_update_callback = callback
-    
-    def stop(self):
-        """停止系统"""
-        self.running = False
-    
-    def get_eco_context(self):
-        """获取当前生态系统的上下文信息"""
-        return {
-            'temperature': round(self.temperature, 1),
-            'humidity': round(self.humidity, 1),
-            'light_level': round(self.light_level, 1),
-            'weather_condition': self.weather_condition,
-            'weather_temperature': round(self.weather_temperature, 1),
-            'weather_humidity': round(self.weather_humidity, 1),
-            'weather_city': self.weather_city,
-            'ventilation_active': self.ventilation_active,
-            'ventilation_speed': self.ventilation_speed,
-            'lighting_active': self.lighting_active,
-            'lighting_brightness': self.lighting_brightness,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智态生域 - 微型生态室监控系统</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.5/dist/purify.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Arial', 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+            transition: background-color 0.5s ease, color 0.3s ease;
         }
-
-# 创建生态系统实例
-eco_system = EcoSystem()
-
-# 路由
-@app.route('/')
-def index():
-    return render_template('dashboard.html')
-
-@app.route('/api/sensor_data', methods=['GET'])
-def get_sensor_data():
-    """获取传感器数据API"""
-    data = eco_system.get_eco_context()
-    return jsonify(data)
-
-@app.route('/api/control/ventilation', methods=['POST'])
-def control_ventilation():
-    """控制通风系统"""
-    data = request.get_json()
-    ventilation_on = data.get('ventilation_on')
-    speed = data.get('speed', 0)
-    
-    eco_system.ventilation_active = ventilation_on
-    eco_system.ventilation_speed = speed
-    
-    # 调用回调函数
-    if eco_system.ventilation_callback:
-        eco_system.ventilation_callback(ventilation_on, speed)
-    
-    return jsonify({
-        'success': True,
-        'message': f'通风控制: {"开启" if ventilation_on else "关闭"}, 速度: {speed}%'
-    })
-
-@app.route('/api/control/lighting', methods=['POST'])
-def control_lighting():
-    """控制照明系统"""
-    data = request.get_json()
-    lighting_on = data.get('lighting_on')
-    brightness = data.get('brightness', 0)
-    
-    eco_system.lighting_active = lighting_on
-    eco_system.lighting_brightness = brightness
-    
-    # 调用回调函数
-    if eco_system.lighting_callback:
-        eco_system.lighting_callback(lighting_on, brightness)
-    
-    return jsonify({
-        'success': True,
-        'message': f'照明控制: {"开启" if lighting_on else "关闭"}, 亮度: {brightness}%'
-    })
-
-@app.route('/api/chat', methods=['POST'])
-def chat_with_deepseek():
-    """与DeepSeek大模型聊天"""
-    try:
-        user_message = request.get_json().get('message', '').strip()
         
-        if not user_message:
-            return jsonify({'error': '消息不能为空'}), 400
+        :root {
+            --primary-color: #4CAF50;
+            --secondary-color: #2196F3;
+            --warning-color: #FFC107;
+            --danger-color: #f44336;
+            --success-color: #4CAF50;
+            --ai-color: #9c27b0;
+            --voice-color: #ff5722;
+            --border-radius: 15px;
+            --shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
         
-        # 获取当前生态系统上下文
-        eco_context = eco_system.get_eco_context()
+        body {
+            background: linear-gradient(135deg, #1a2b3c 0%, #0d1a26 100%);
+            color: #ffffff;
+            min-height: 100vh;
+            overflow-x: hidden;
+            transition: background 0.8s ease;
+        }
         
-        # 构建系统提示
-        system_prompt = f"""你是一位生态治理专家助手，专门帮助用户管理和监控微型生态室。
-当前生态室状态：
-- 室内温度: {eco_context['temperature']}°C (适宜范围: 20-30°C)
-- 室内湿度: {eco_context['humidity']}% (适宜范围: 40-80%)
-- 室内光照: {eco_context['light_level']} lux (适宜范围: 500-2000 lux)
-- 宁波市室外天气: {eco_context['weather_condition']}
-- 室外温度: {eco_context['weather_temperature']}°C
-- 室外湿度: {eco_context['weather_humidity']}%
-- 通风系统: {'开启' if eco_context['ventilation_active'] else '关闭'}, 速度: {eco_context['ventilation_speed']}%
-- 照明系统: {'开启' if eco_context['lighting_active'] else '关闭'}, 亮度: {eco_context['lighting_brightness']}%
-请根据当前状态和室外天气提供专业建议，帮助用户优化生态室环境。你可以：
-1. 分析当前环境参数是否在适宜范围内
-2. 根据室外天气建议调整通风、照明等控制参数
-3. 解释自然天气对室内生态的影响
-4. 提供生物多样性保护建议
-5. 回答生态治理相关问题
-请用中文回复，保持专业但易懂的语气。"""
+        body.environment-excellent {
+            background: linear-gradient(135deg, #0d2b1a 0%, #071a0d 100%);
+        }
         
-        # 准备消息历史
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ]
+        body.environment-good {
+            background: linear-gradient(135deg, #1a3c2a 0%, #0d2619 100%);
+        }
         
-        # 调用DeepSeek API
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=messages,
-            temperature=0.7,
-            max_tokens=500,
-            stream=False
-        )
+        body.environment-okay {
+            background: linear-gradient(135deg, #2a4c1a 0%, #19360d 100%);
+        }
         
-        ai_response = response.choices[0].message.content.strip()
+        body.environment-warning {
+            background: linear-gradient(135deg, #4c4c1a 0%, #36360d 100%);
+        }
         
-        # 保存到聊天历史
-        eco_system.chat_history.append({
-            'user': user_message,
-            'ai': ai_response,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        })
+        body.environment-poor {
+            background: linear-gradient(135deg, #6c5c1a 0%, #50450d 100%);
+        }
         
-        # 保留最近10条对话
-        if len(eco_system.chat_history) > 10:
-            eco_system.chat_history = eco_system.chat_history[-10:]
+        body.environment-danger {
+            background: linear-gradient(135deg, #6c1a1a 0%, #500d0d 100%);
+        }
         
-        return jsonify({
-            'success': True,
-            'response': ai_response,
-            'context': eco_context
-        })
-    
-    except Exception as e:
-        print(f"DeepSeek API错误: {e}")
-        return jsonify({
-            'success': False,
-            'error': '与DeepSeek通信失败，请稍后再试',
-            'details': str(e)
-        }), 500
-
-@app.route('/api/chat/history')
-def get_chat_history():
-    """获取聊天历史"""
-    return jsonify({
-        'history': eco_system.chat_history,
-        'context': eco_system.get_eco_context()
-    })
-
-@app.route('/input', methods=['GET'])
-def receive_sensor_data():
-    """接收来自主控板的传感器数据 - 硬件接口"""
-    try:
-        # 从请求参数获取传感器数据
-        temp = request.args.get('temp')
-        hum = request.args.get('hum')
-        light = request.args.get('light')
+        .environment-status-bar {
+            height: 8px;
+            background: linear-gradient(90deg, var(--status-color-start) 0%, var(--status-color-end) 100%);
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 1000;
+            transition: background 0.5s ease;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+        }
         
-        if temp is not None and hum is not None and light is not None:
-            # 更新内部状态
-            eco_system.temperature = float(temp)
-            eco_system.humidity = float(hum)
-            eco_system.light_level = int(light)
+        .environment-status-text {
+            position: fixed;
+            top: 12px;
+            right: 20px;
+            color: white;
+            font-weight: bold;
+            font-size: 1.1rem;
+            text-shadow: 0 0 5px rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            transition: color 0.3s ease;
+        }
+        
+        .environment-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+            background: var(--status-color-start);
+            transition: background 0.3s ease;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        /* 标题区域 */
+        .header {
+            text-align: center;
+            padding: 20px 0;
+            margin-bottom: 30px;
+            border-bottom: 2px solid var(--primary-color);
+            position: relative;
+        }
+        
+        .header::after {
+            content: '';
+            position: absolute;
+            bottom: -2px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 100px;
+            height: 3px;
+            background: var(--primary-color);
+        }
+        
+        .main-title {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: var(--primary-color);
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+        }
+        
+        .main-title i {
+            font-size: 2.8rem;
+        }
+        
+        .subtitle {
+            font-size: 1.2rem;
+            color: #a0c49d;
+            margin-top: 5px;
+        }
+        
+        .tagline {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin-top: 15px;
+        }
+        
+        .tagline-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            color: var(--text-muted);
+        }
+        
+        /* 主内容区域 - 网格布局 */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 25px;
+            margin-bottom: 30px;
+        }
+        
+        .data-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        
+        .control-grid {
+            display: grid;
+            grid-template-rows: auto auto;
+            gap: 20px;
+        }
+        
+        /* 数据卡片 */
+        .data-card {
+            background: rgba(44, 62, 80, 0.85);
+            backdrop-filter: blur(10px);
+            border-radius: var(--border-radius);
+            padding: 25px;
+            box-shadow: var(--shadow);
+            border: 1px solid rgba(76, 175, 80, 0.2);
+            transition: transform 0.3s ease, box-shadow 0.3s ease, background 0.3s ease;
+        }
+        
+        body.environment-excellent .data-card {
+            background: rgba(26, 60, 42, 0.85);
+            border-color: rgba(76, 175, 80, 0.3);
+        }
+        
+        body.environment-good .data-card {
+            background: rgba(42, 76, 42, 0.85);
+            border-color: rgba(76, 175, 80, 0.3);
+        }
+        
+        body.environment-okay .data-card {
+            background: rgba(66, 92, 42, 0.85);
+            border-color: rgba(124, 172, 42, 0.3);
+        }
+        
+        body.environment-warning .data-card {
+            background: rgba(92, 92, 42, 0.85);
+            border-color: rgba(172, 172, 42, 0.3);
+        }
+        
+        body.environment-poor .data-card {
+            background: rgba(108, 92, 42, 0.85);
+            border-color: rgba(204, 153, 42, 0.3);
+        }
+        
+        body.environment-danger .data-card {
+            background: rgba(108, 42, 42, 0.85);
+            border-color: rgba(204, 77, 77, 0.3);
+        }
+        
+        .data-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+        }
+        
+        .card-header {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .card-icon {
+            font-size: 2.2rem;
+            color: var(--primary-color);
+        }
+        
+        body.environment-warning .card-icon,
+        body.environment-poor .card-icon,
+        body.environment-danger .card-icon {
+            color: var(--warning-color);
+        }
+        
+        body.environment-danger .card-icon {
+            color: var(--danger-color);
+        }
+        
+        .card-title {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #ffffff;
+        }
+        
+        .card-value {
+            font-size: 2.8rem;
+            font-weight: bold;
+            color: var(--primary-color);
+            margin: 15px 0;
+            text-align: center;
+        }
+        
+        body.environment-warning .card-value,
+        body.environment-poor .card-value {
+            color: var(--warning-color);
+        }
+        
+        body.environment-danger .card-value {
+            color: var(--danger-color);
+        }
+        
+        .card-range {
+            color: #7f8c8d;
+            font-size: 0.95rem;
+            text-align: center;
+            margin-top: 5px;
+        }
+        
+        .progress-container {
+            margin-top: 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            height: 12px;
+            overflow: hidden;
+        }
+        
+        .progress-bar {
+            height: 100%;
+            background: var(--primary-color);
+            border-radius: 10px;
+            transition: width 0.5s ease, background 0.3s ease;
+        }
+        
+        body.environment-warning .progress-bar,
+        body.environment-poor .progress-bar {
+            background: var(--warning-color);
+        }
+        
+        body.environment-danger .progress-bar {
+            background: var(--danger-color);
+        }
+        
+        .progress-text {
+            text-align: center;
+            font-size: 0.9rem;
+            margin-top: 5px;
+            color: #7f8c8d;
+        }
+        
+        /* 天气卡片特殊样式 */
+        .weather-card {
+            background: rgba(72, 122, 190, 0.85) !important;
+            border-color: rgba(100, 160, 220, 0.5) !important;
+        }
+        
+        .weather-card .card-icon {
+            color: #3498db !important;
+        }
+        
+        .weather-card .card-value {
+            color: #3498db !important;
+        }
+        
+        /* 天气状况特殊样式 */
+        .weather-condition {
+            font-size: 1.4rem;
+            font-weight: bold;
+            color: #3498db;
+            text-align: center;
+            margin: 10px 0;
+        }
+        
+        .weather-details {
+            display: flex;
+            justify-content: space-around;
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .weather-detail {
+            text-align: center;
+        }
+        
+        .weather-detail-icon {
+            font-size: 1.8rem;
+            margin-bottom: 5px;
+        }
+        
+        .weather-detail-value {
+            font-size: 1.2rem;
+            font-weight: bold;
+            color: #ffffff;
+        }
+        
+        .weather-detail-label {
+            font-size: 0.9rem;
+            color: #a0c49d;
+        }
+        
+        /* 控制面板 */
+        .control-panel {
+            background: rgba(44, 62, 80, 0.85);
+            backdrop-filter: blur(10px);
+            border-radius: var(--border-radius);
+            padding: 30px;
+            box-shadow: var(--shadow);
+            border: 1px solid rgba(76, 175, 80, 0.2);
+            transition: background 0.3s ease, border-color 0.3s ease;
+        }
+        
+        body.environment-excellent .control-panel {
+            background: rgba(26, 60, 42, 0.85);
+            border-color: rgba(76, 175, 80, 0.3);
+        }
+        
+        body.environment-good .control-panel {
+            background: rgba(42, 76, 42, 0.85);
+            border-color: rgba(76, 175, 80, 0.3);
+        }
+        
+        body.environment-okay .control-panel {
+            background: rgba(66, 92, 42, 0.85);
+            border-color: rgba(124, 172, 42, 0.3);
+        }
+        
+        body.environment-warning .control-panel {
+            background: rgba(92, 92, 42, 0.85);
+            border-color: rgba(172, 172, 42, 0.3);
+        }
+        
+        body.environment-poor .control-panel {
+            background: rgba(108, 92, 42, 0.85);
+            border-color: rgba(204, 153, 42, 0.3);
+        }
+        
+        body.environment-danger .control-panel {
+            background: rgba(108, 42, 42, 0.85);
+            border-color: rgba(204, 77, 77, 0.3);
+        }
+        
+        .panel-title {
+            font-size: 1.8rem;
+            font-weight: bold;
+            color: var(--primary-color);
+            margin-bottom: 25px;
+            text-align: center;
+        }
+        
+        .control-section {
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .control-section:last-child {
+            border-bottom: none;
+            margin-bottom: 0;
+            padding-bottom: 0;
+        }
+        
+        .section-header {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .section-icon {
+            font-size: 1.8rem;
+            color: #a0c49d;
+        }
+        
+        .section-title {
+            font-size: 1.4rem;
+            font-weight: bold;
+            color: #ffffff;
+        }
+        
+        .status-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .status-label {
+            font-size: 1.1rem;
+            color: #7f8c8d;
+        }
+        
+        .status-value {
+            font-size: 1.3rem;
+            font-weight: bold;
+            color: var(--danger-color);
+            transition: color 0.3s ease;
+        }
+        
+        .status-value.active {
+            color: var(--success-color);
+        }
+        
+        body.environment-warning .status-value,
+        body.environment-poor .status-value {
+            color: var(--warning-color);
+        }
+        
+        body.environment-danger .status-value {
+            color: var(--danger-color);
+        }
+        
+        .slider-container {
+            margin-bottom: 25px;
+        }
+        
+        .slider-label {
+            font-size: 1.1rem;
+            color: #7f8c8d;
+            margin-bottom: 10px;
+        }
+        
+        .slider {
+            width: 100%;
+            height: 12px;
+            -webkit-appearance: none;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 6px;
+            outline: none;
+        }
+        
+        .slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: var(--primary-color);
+            cursor: pointer;
+            transition: background 0.3s ease;
+        }
+        
+        body.environment-warning .slider::-webkit-slider-thumb,
+        body.environment-poor .slider::-webkit-slider-thumb {
+            background: var(--warning-color);
+        }
+        
+        body.environment-danger .slider::-webkit-slider-thumb {
+            background: var(--danger-color);
+        }
+        
+        .slider::-webkit-slider-thumb:hover {
+            transform: scale(1.2);
+        }
+        
+        .slider-values {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 5px;
+        }
+        
+        .slider-min, .slider-max {
+            font-size: 0.9rem;
+            color: #7f8c8d;
+        }
+        
+        .slider-value {
+            font-size: 1.1rem;
+            font-weight: bold;
+            color: var(--primary-color);
+        }
+        
+        body.environment-warning .slider-value,
+        body.environment-poor .slider-value {
+            color: var(--warning-color);
+        }
+        
+        body.environment-danger .slider-value {
+            color: var(--danger-color);
+        }
+        
+        .control-buttons {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-top: 10px;
+        }
+        
+        .control-btn {
+            padding: 15px;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+        
+        .btn-ventilation {
+            background: var(--secondary-color);
+            color: white;
+        }
+        
+        .btn-ventilation:hover {
+            background: #1976D2;
+            transform: translateY(-2px);
+        }
+        
+        .btn-ventilation.active {
+            background: var(--danger-color);
+        }
+        
+        .btn-ventilation.active:hover {
+            background: #d32f2f;
+        }
+        
+        .btn-lighting {
+            background: var(--warning-color);
+            color: #333;
+        }
+        
+        .btn-lighting:hover {
+            background: #FFB300;
+            transform: translateY(-2px);
+        }
+        
+        .btn-lighting.active {
+            background: var(--danger-color);
+            color: white;
+        }
+        
+        .btn-lighting.active:hover {
+            background: #d32f2f;
+        }
+        
+        .btn-auto {
+            background: var(--ai-color);
+            color: white;
+        }
+        
+        .btn-auto:hover {
+            background: #7b1fa2;
+        }
+        
+        /* AI助手面板 */
+        .ai-panel {
+            background: rgba(44, 62, 80, 0.85);
+            backdrop-filter: blur(10px);
+            border-radius: var(--border-radius);
+            padding: 25px;
+            box-shadow: var(--shadow);
+            border: 1px solid rgba(156, 39, 176, 0.3);
+            height: fit-content;
+            position: sticky;
+            top: 20px;
+            transition: background 0.3s ease, border-color 0.3s ease;
+        }
+        
+        body.environment-excellent .ai-panel {
+            background: rgba(26, 60, 42, 0.85);
+            border-color: rgba(76, 175, 80, 0.3);
+        }
+        
+        body.environment-good .ai-panel {
+            background: rgba(42, 76, 42, 0.85);
+            border-color: rgba(76, 175, 80, 0.3);
+        }
+        
+        body.environment-okay .ai-panel {
+            background: rgba(66, 92, 42, 0.85);
+            border-color: rgba(124, 172, 42, 0.3);
+        }
+        
+        body.environment-warning .ai-panel {
+            background: rgba(92, 92, 42, 0.85);
+            border-color: rgba(172, 172, 42, 0.3);
+        }
+        
+        body.environment-poor .ai-panel {
+            background: rgba(108, 92, 42, 0.85);
+            border-color: rgba(204, 153, 42, 0.3);
+        }
+        
+        body.environment-danger .ai-panel {
+            background: rgba(108, 42, 42, 0.85);
+            border-color: rgba(204, 77, 77, 0.3);
+        }
+        
+        .ai-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid var(--ai-color);
+        }
+        
+        .ai-title-container {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .ai-icon {
+            font-size: 2.2rem;
+            color: var(--ai-color);
+        }
+        
+        .ai-title {
+            font-size: 1.6rem;
+            font-weight: bold;
+            color: #ffffff;
+        }
+        
+        .voice-controls {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .voice-btn {
+            background: var(--voice-color);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            font-size: 1.2rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .voice-btn:hover {
+            background: #e64a19;
+            transform: scale(1.1);
+        }
+        
+        .voice-btn.recording {
+            background: var(--danger-color);
+            animation: pulse 1.5s infinite;
+        }
+        
+        .voice-status {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 0.9rem;
+            color: #7f8c8d;
+            margin-top: 5px;
+        }
+        
+        .voice-indicator {
+            width: 10px;
+            height: 10px;
+            background: var(--voice-color);
+            border-radius: 50%;
+            transition: all 0.3s ease;
+        }
+        
+        .voice-indicator.active {
+            background: var(--danger-color);
+            box-shadow: 0 0 8px var(--danger-color);
+        }
+        
+        .chat-container {
+            height: 400px;
+            overflow-y: auto;
+            margin-bottom: 15px;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+        }
+        
+        .message {
+            margin-bottom: 15px;
+            padding: 12px 15px;
+            border-radius: 18px;
+            max-width: 85%;
+            position: relative;
+            animation: fadeIn 0.3s ease;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .user-message {
+            background: var(--primary-color);
+            color: white;
+            margin-left: auto;
+            border-bottom-right-radius: 5px;
+        }
+        
+        .ai-message {
+            background: rgba(156, 39, 176, 0.2);
+            color: #ffffff;
+            border-bottom-left-radius: 5px;
+            border-left: 3px solid var(--ai-color);
+        }
+        
+        .message-content {
+            line-height: 1.5;
+            word-wrap: break-word;
+        }
+        
+        .message-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+            opacity: 0.7;
+            transition: opacity 0.3s ease;
+        }
+        
+        .message:hover .message-actions {
+            opacity: 1;
+        }
+        
+        .action-btn {
+            background: rgba(255, 255, 255, 0.2);
+            border: none;
+            color: white;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .action-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: scale(1.1);
+        }
+        
+        /* Markdown样式 */
+        .message-content h1, .message-content h2, .message-content h3, 
+        .message-content h4, .message-content h5, .message-content h6 {
+            color: #ffffff;
+            margin: 15px 0 10px 0;
+            font-weight: bold;
+        }
+        
+        .message-content h1 { font-size: 1.8rem; }
+        .message-content h2 { font-size: 1.6rem; }
+        .message-content h3 { font-size: 1.4rem; }
+        .message-content h4 { font-size: 1.2rem; }
+        .message-content h5 { font-size: 1.1rem; }
+        .message-content h6 { font-size: 1rem; }
+        
+        .message-content p {
+            margin: 8px 0;
+            line-height: 1.6;
+        }
+        
+        .message-content ul, .message-content ol {
+            margin: 10px 0;
+            padding-left: 25px;
+        }
+        
+        .message-content li {
+            margin: 5px 0;
+            line-height: 1.5;
+        }
+        
+        .message-content strong {
+            color: var(--primary-color);
+            font-weight: bold;
+        }
+        
+        .message-content em {
+            color: var(--warning-color);
+            font-style: italic;
+        }
+        
+        .message-content code {
+            background: rgba(255, 255, 255, 0.15);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.95em;
+        }
+        
+        .message-content pre {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 12px 15px;
+            border-radius: 8px;
+            margin: 10px 0;
+            overflow-x: auto;
+            font-family: monospace;
+            font-size: 0.95em;
+        }
+        
+        .message-content blockquote {
+            border-left: 3px solid var(--primary-color);
+            padding-left: 15px;
+            margin: 10px 0;
+            color: #a0c49d;
+            font-style: italic;
+        }
+        
+        body.environment-warning .message-content blockquote,
+        body.environment-poor .message-content blockquote {
+            border-left-color: var(--warning-color);
+            color: #f39c12;
+        }
+        
+        body.environment-danger .message-content blockquote {
+            border-left-color: var(--danger-color);
+            color: #e74c3c;
+        }
+        
+        .message-content table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 10px 0;
+            font-size: 0.95em;
+        }
+        
+        .message-content th, .message-content td {
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            padding: 8px;
+            text-align: left;
+        }
+        
+        .message-content th {
+            background: rgba(76, 175, 80, 0.2);
+            font-weight: bold;
+        }
+        
+        body.environment-warning .message-content th,
+        body.environment-poor .message-content th {
+            background: rgba(243, 156, 18, 0.2);
+        }
+        
+        body.environment-danger .message-content th {
+            background: rgba(231, 76, 60, 0.2);
+        }
+        
+        .message-content a {
+            color: var(--secondary-color);
+            text-decoration: underline;
+        }
+        
+        .message-content a:hover {
+            color: #1565c0;
+        }
+        
+        .message-content img {
+            max-width: 100%;
+            height: auto;
+            margin: 10px 0;
+            border-radius: 8px;
+        }
+        
+        .message-time {
+            font-size: 0.8rem;
+            color: #7f8c8d;
+            margin-top: 5px;
+            text-align: right;
+        }
+        
+        .ai-message .message-time {
+            text-align: left;
+        }
+        
+        .chat-input {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        #chat-message {
+            flex: 1;
+            padding: 12px 15px;
+            border: 2px solid rgba(156, 39, 176, 0.3);
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.1);
+            color: #ffffff;
+            font-size: 1rem;
+            resize: none;
+            min-height: 50px;
+            max-height: 100px;
+            transition: border-color 0.3s ease;
+        }
+        
+        #chat-message:focus {
+            outline: none;
+            border-color: var(--ai-color);
+            box-shadow: 0 0 0 3px rgba(156, 39, 176, 0.2);
+        }
+        
+        .chat-buttons {
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+        }
+        
+        #send-chat {
+            background: var(--ai-color);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            padding: 0 20px;
+            font-size: 1.1rem;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 50px;
+        }
+        
+        #send-chat:hover {
+            background: #7b1fa2;
+            transform: translateY(-2px);
+        }
+        
+        #send-chat:disabled {
+            background: #9c27b080;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .thinking {
+            display: flex;
+            gap: 4px;
+            align-items: center;
+            color: #7f8c8d;
+            font-style: italic;
+            margin-top: 10px;
+            font-size: 0.9rem;
+        }
+        
+        .dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: var(--ai-color);
+            border-radius: 50%;
+            animation: pulse 1.5s infinite;
+        }
+        
+        .dot:nth-child(2) {
+            animation-delay: 0.3s;
+        }
+        
+        .dot:nth-child(3) {
+            animation-delay: 0.6s;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 0.4; transform: scale(0.8); }
+            50% { opacity: 1; transform: scale(1); }
+        }
+        
+        .ai-suggestions {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        
+        .suggestion-btn {
+            padding: 8px 12px;
+            background: rgba(156, 39, 176, 0.2);
+            border: 1px solid rgba(156, 39, 176, 0.3);
+            border-radius: 8px;
+            color: #ffffff;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-align: center;
+        }
+        
+        .suggestion-btn:hover {
+            background: rgba(156, 39, 176, 0.4);
+            transform: translateY(-1px);
+        }
+        
+        /* 图表区域 */
+        .charts-section {
+            grid-column: span 2;
+            margin-top: 20px;
+        }
+        
+        .chart-container {
+            background: rgba(44, 62, 80, 0.85);
+            backdrop-filter: blur(10px);
+            border-radius: var(--border-radius);
+            padding: 25px;
+            box-shadow: var(--shadow);
+            border: 1px solid rgba(76, 175, 80, 0.2);
+            height: 300px;
+            transition: background 0.3s ease, border-color 0.3s ease;
+        }
+        
+        body.environment-excellent .chart-container {
+            background: rgba(26, 60, 42, 0.85);
+            border-color: rgba(76, 175, 80, 0.3);
+        }
+        
+        body.environment-good .chart-container {
+            background: rgba(42, 76, 42, 0.85);
+            border-color: rgba(76, 175, 80, 0.3);
+        }
+        
+        body.environment-okay .chart-container {
+            background: rgba(66, 92, 42, 0.85);
+            border-color: rgba(124, 172, 42, 0.3);
+        }
+        
+        body.environment-warning .chart-container {
+            background: rgba(92, 92, 42, 0.85);
+            border-color: rgba(172, 172, 42, 0.3);
+        }
+        
+        body.environment-poor .chart-container {
+            background: rgba(108, 92, 42, 0.85);
+            border-color: rgba(204, 153, 42, 0.3);
+        }
+        
+        body.environment-danger .chart-container {
+            background: rgba(108, 42, 42, 0.85);
+            border-color: rgba(204, 77, 77, 0.3);
+        }
+        
+        .chart-title {
+            font-size: 1.6rem;
+            font-weight: bold;
+            color: var(--primary-color);
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        
+        canvas {
+            width: 100% !important;
+            height: 220px !important;
+        }
+        
+        /* 状态栏 */
+        .status-bar {
+            background: rgba(44, 62, 80, 0.9);
+            backdrop-filter: blur(10px);
+            padding: 15px 20px;
+            border-radius: 10px;
+            display: flex;
+            justify-content: space-around;
+            margin-top: 20px;
+            border: 1px solid rgba(76, 175, 80, 0.3);
+            transition: background 0.3s ease, border-color 0.3s ease;
+        }
+        
+        body.environment-excellent .status-bar {
+            background: rgba(26, 60, 42, 0.9);
+            border-color: rgba(76, 175, 80, 0.3);
+        }
+        
+        body.environment-good .status-bar {
+            background: rgba(42, 76, 42, 0.9);
+            border-color: rgba(76, 175, 80, 0.3);
+        }
+        
+        body.environment-okay .status-bar {
+            background: rgba(66, 92, 42, 0.9);
+            border-color: rgba(124, 172, 42, 0.3);
+        }
+        
+        body.environment-warning .status-bar {
+            background: rgba(92, 92, 42, 0.9);
+            border-color: rgba(172, 172, 42, 0.3);
+        }
+        
+        body.environment-poor .status-bar {
+            background: rgba(108, 92, 42, 0.9);
+            border-color: rgba(204, 153, 42, 0.3);
+        }
+        
+        body.environment-danger .status-bar {
+            background: rgba(108, 42, 42, 0.9);
+            border-color: rgba(204, 77, 77, 0.3);
+        }
+        
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .status-icon {
+            font-size: 1.2rem;
+            color: var(--primary-color);
+        }
+        
+        .status-text {
+            font-size: 1rem;
+            color: #7f8c8d;
+        }
+        
+        .status-value.good {
+            color: var(--success-color);
+        }
+        
+        .status-value.warning {
+            color: var(--warning-color);
+        }
+        
+        .status-value.danger {
+            color: var(--danger-color);
+        }
+        
+        /* 响应式设计 */
+        @media (max-width: 1200px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
             
-            print(f"收到传感器数据：温度={temp}℃, 湿度={hum}%, 光照={light}Lux")
+            .ai-panel {
+                position: static;
+                height: auto;
+            }
             
-            # 通过WebSocket广播更新
-            socketio.emit('sensor_data', {
-                'temperature': round(eco_system.temperature, 1),
-                'humidity': round(eco_system.humidity, 1),
-                'light_level': round(eco_system.light_level, 1),
-                'weather_condition': eco_system.weather_condition,
-                'weather_temperature': round(eco_system.weather_temperature, 1),
-                'weather_humidity': round(eco_system.weather_humidity, 1),
-                'weather_city': eco_system.weather_city,
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            .charts-section {
+                grid-column: span 1;
+            }
+        }
+        
+        @media (max-width: 768px) {
+            .main-title {
+                font-size: 2rem;
+            }
+            
+            .card-value {
+                font-size: 2.2rem;
+            }
+            
+            .control-buttons, .ai-suggestions {
+                grid-template-columns: 1fr;
+            }
+            
+            .tagline {
+                flex-direction: column;
+                gap: 8px;
+            }
+            
+            .chat-container {
+                height: 300px;
+            }
+            
+            .voice-controls {
+                gap: 5px;
+            }
+            
+            .voice-btn {
+                width: 35px;
+                height: 35px;
+                font-size: 1rem;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .container {
+                padding: 10px;
+            }
+            
+            .data-card, .control-panel, .chart-container, .ai-panel {
+                padding: 15px;
+            }
+            
+            .card-value {
+                font-size: 1.8rem;
+            }
+            
+            .main-title {
+                font-size: 1.6rem;
+            }
+            
+            .section-title, .ai-title {
+                font-size: 1.2rem;
+            }
+            
+            .chat-container {
+                height: 250px;
+            }
+            
+            .chat-input {
+                flex-direction: column;
+            }
+            
+            .chat-buttons {
+                width: 100%;
+                justify-content: center;
+            }
+        }
+        
+        /* 滚动条样式 */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 4px;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: var(--primary-color);
+            border-radius: 4px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: #3d8b40;
+        }
+        
+        /* 动画效果 */
+        .notification {
+            position: fixed;
+            top: 30px;
+            right: 20px;
+            padding: 15px 25px;
+            background: var(--success-color);
+            color: white;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+            transform: translateX(150%);
+            transition: transform 0.3s ease;
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .notification.show {
+            transform: translateX(0);
+        }
+        
+        .notification.error {
+            background: var(--danger-color);
+        }
+        
+        .notification.ai {
+            background: var(--ai-color);
+        }
+        
+        .notification.voice {
+            background: var(--voice-color);
+        }
+        
+        /* AI助手样式 */
+        .ai-highlight {
+            background: linear-gradient(120deg, rgba(156, 39, 176, 0.3), rgba(103, 58, 183, 0.3));
+            padding: 20px;
+            border-radius: 12px;
+            margin: 15px 0;
+            border-left: 3px solid var(--ai-color);
+        }
+        
+        .ai-tip {
+            background: rgba(76, 175, 80, 0.2);
+            border-left: 3px solid var(--primary-color);
+            padding: 12px 15px;
+            border-radius: 0 8px 8px 0;
+            margin: 10px 0;
+        }
+        
+        .ai-warning {
+            background: rgba(255, 193, 7, 0.2);
+            border-left: 3px solid var(--warning-color);
+            padding: 12px 15px;
+            border-radius: 0 8px 8px 0;
+            margin: 10px 0;
+        }
+        
+        .ai-ecological {
+            color: var(--primary-color);
+            font-weight: bold;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 0.4; transform: scale(0.8); }
+            50% { opacity: 1; transform: scale(1); }
+        }
+        
+        /* 环境评分卡片 */
+        .environment-score-card {
+            background: rgba(44, 62, 80, 0.85);
+            backdrop-filter: blur(10px);
+            border-radius: var(--border-radius);
+            padding: 20px;
+            box-shadow: var(--shadow);
+            border: 1px solid rgba(76, 175, 80, 0.2);
+            margin-bottom: 20px;
+            transition: all 0.3s ease;
+        }
+        
+        .environment-score-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .environment-score-title {
+            font-size: 1.4rem;
+            font-weight: bold;
+            color: var(--primary-color);
+        }
+        
+        .environment-score-value {
+            font-size: 2.2rem;
+            font-weight: bold;
+            background: linear-gradient(45deg, var(--status-color-start), var(--status-color-end));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .environment-score-bar {
+            height: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 15px 0;
+        }
+        
+        .environment-score-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--status-color-start), var(--status-color-end));
+            border-radius: 4px;
+            transition: width 0.5s ease;
+        }
+        
+        .environment-status-description {
+            font-size: 1rem;
+            color: #7f8c8d;
+            margin-top: 10px;
+        }
+        
+        .environment-recommendations {
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .recommendation-title {
+            font-size: 1.1rem;
+            font-weight: bold;
+            color: var(--primary-color);
+            margin-bottom: 8px;
+        }
+        
+        .recommendation-list {
+            color: #a0c49d;
+            margin-left: 20px;
+        }
+        
+        .recommendation-list li {
+            margin: 5px 0;
+            line-height: 1.4;
+        }
+        
+        /* 天气条件图标 */
+        .weather-icon-sunny { color: #f39c12; }
+        .weather-icon-cloudy { color: #95a5a6; }
+        .weather-icon-rainy { color: #3498db; }
+        .weather-icon-snowy { color: #3498db; }
+        .weather-icon-storm { color: #9b59b6; }
+    </style>
+</head>
+<body>
+    <div class="environment-status-bar"></div>
+    <div class="environment-status-text">
+        <span class="environment-indicator"></span>
+        <span class="status-text">环境状态: 优秀</span>
+    </div>
+    
+    <div class="container">
+        <header class="header">
+            <div class="main-title">
+                <i class="fas fa-leaf"></i>
+                <span>智态生域</span>
+            </div>
+            <div class="subtitle">微型生态室智能监控系统</div>
+            <div class="tagline">
+                <div class="tagline-item">
+                    <span class="fas fa-globe"></span>
+                    <span>用科技连接人类与自然</span>
+                </div>
+                <div class="tagline-item">
+                    <span class="fas fa-tint"></span>
+                    <span>保护生物多样性</span>
+                </div>
+            </div>
+        </header>
+        
+        <main class="main-grid">
+            <div class="left-panel">
+                <div class="environment-score-card">
+                    <div class="environment-score-header">
+                        <div class="environment-score-title">🌱 环境健康评分</div>
+                        <div class="environment-score-value" id="environment-score">92</div>
+                    </div>
+                    <div class="environment-score-bar">
+                        <div class="environment-score-fill" id="environment-score-fill" style="width: 92%;"></div>
+                    </div>
+                    <div class="environment-status-description" id="environment-description">
+                        室内外环境协同最佳，生态系统处于最佳状态！
+                    </div>
+                    <div class="environment-recommendations" id="environment-recommendations">
+                        <div class="recommendation-title">🔧 优化建议</div>
+                        <ul class="recommendation-list">
+                            <li>保持当前设置，室外天气适宜，可适当增加通风</li>
+                            <li>利用室外良好天气条件，增强室内生物多样性</li>
+                        </ul>
+                    </div>
+                </div>
+                
+                <div class="data-grid">
+                    <div class="data-card">
+                        <div class="card-header">
+                            <div class="card-icon">🌡️</div>
+                            <div class="card-title">室内温度</div>
+                        </div>
+                        <div class="card-value" id="temperature-value">25.5°C</div>
+                        <div class="card-range">适宜范围: 20-30°C</div>
+                        <div class="progress-container">
+                            <div class="progress-bar" id="temperature-progress" style="width: 55%;"></div>
+                        </div>
+                        <div class="progress-text"><span id="temperature-percent">55</span>%</div>
+                    </div>
+                    
+                    <div class="data-card">
+                        <div class="card-header">
+                            <div class="card-icon">💧</div>
+                            <div class="card-title">室内湿度</div>
+                        </div>
+                        <div class="card-value" id="humidity-value">65%</div>
+                        <div class="card-range">适宜范围: 40-80%</div>
+                        <div class="progress-container">
+                            <div class="progress-bar" id="humidity-progress" style="width: 65%;"></div>
+                        </div>
+                        <div class="progress-text"><span id="humidity-percent">65</span>%</div>
+                    </div>
+                    
+                    <div class="data-card">
+                        <div class="card-header">
+                            <div class="card-icon">☀️</div>
+                            <div class="card-title">室内光照</div>
+                        </div>
+                        <div class="card-value" id="light-value">850 lux</div>
+                        <div class="card-range">适宜范围: 500-2000 lux</div>
+                        <div class="progress-container">
+                            <div class="progress-bar" id="light-progress" style="width: 42.5%;"></div>
+                        </div>
+                        <div class="progress-text"><span id="light-percent">42</span>%</div>
+                    </div>
+                    
+                    <div class="data-card weather-card">
+                        <div class="card-header">
+                            <div class="card-icon"><i class="fas fa-cloud weather-icon-sunny"></i></div>
+                            <div class="card-title">宁波天气</div>
+                        </div>
+                        <div class="weather-condition" id="weather-condition">晴</div>
+                        <div class="card-value" id="weather-temperature">22°C</div>
+                        <div class="card-range" id="weather-humidity">室外湿度: 60%</div>
+                        
+                        <div class="weather-details">
+                            <div class="weather-detail">
+                                <div class="weather-detail-icon">
+                                    <i class="fas fa-temperature-high"></i>
+                                </div>
+                                <div class="weather-detail-value" id="weather-temp-detail">22°C</div>
+                                <div class="weather-detail-label">室外温度</div>
+                            </div>
+                            <div class="weather-detail">
+                                <div class="weather-detail-icon">
+                                    <i class="fas fa-tint"></i>
+                                </div>
+                                <div class="weather-detail-value" id="weather-humidity-detail">60%</div>
+                                <div class="weather-detail-label">室外湿度</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="charts-section">
+                    <div class="chart-container">
+                        <div class="chart-title">📈 室内外环境对比</div>
+                        <canvas id="data-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="right-panel">
+                <div class="control-grid">
+                    <div class="control-panel">
+                        <div class="panel-title">🎛️ 环境控制系统</div>
+                        
+                        <div class="control-section">
+                            <div class="section-header">
+                                <div class="section-icon">💨</div>
+                                <div class="section-title">通风系统控制</div>
+                            </div>
+                            
+                            <div class="status-container">
+                                <span class="status-label">状态:</span>
+                                <span class="status-value" id="vent-status">关闭</span>
+                            </div>
+                            
+                            <div class="slider-container">
+                                <div class="slider-label">风速调节:</div>
+                                <input type="range" min="0" max="100" value="0" class="slider" id="ventilation-slider">
+                                <div class="slider-values">
+                                    <span class="slider-min">0%</span>
+                                    <span class="slider-value" id="vent-slider-value">0%</span>
+                                    <span class="slider-max">100%</span>
+                                </div>
+                            </div>
+                            
+                            <div class="control-buttons">
+                                <button class="control-btn btn-ventilation" id="vent-button">
+                                    <span class="fas fa-wind"></span>
+                                    <span>启动通风</span>
+                                </button>
+                                <button class="control-btn btn-auto" id="vent-auto-button">
+                                    <span class="fas fa-robot"></span>
+                                    <span>自动模式</span>
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div class="control-section">
+                            <div class="section-header">
+                                <div class="section-icon">💡</div>
+                                <div class="section-title">照明系统控制</div>
+                            </div>
+                            
+                            <div class="status-container">
+                                <span class="status-label">状态:</span>
+                                <span class="status-value" id="light-status">关闭</span>
+                            </div>
+                            
+                            <div class="slider-container">
+                                <div class="slider-label">亮度调节:</div>
+                                <input type="range" min="0" max="100" value="0" class="slider" id="lighting-slider">
+                                <div class="slider-values">
+                                    <span class="slider-min">0%</span>
+                                    <span class="slider-value" id="light-slider-value">0%</span>
+                                    <span class="slider-max">100%</span>
+                                </div>
+                            </div>
+                            
+                            <div class="control-buttons">
+                                <button class="control-btn btn-lighting" id="light-button">
+                                    <span class="fas fa-lightbulb"></span>
+                                    <span>开启照明</span>
+                                </button>
+                                <button class="control-btn btn-auto" id="light-auto-button">
+                                    <span class="fas fa-sun"></span>
+                                    <span>情景模式</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="ai-panel">
+                        <div class="ai-header">
+                            <div class="ai-title-container">
+                                <div class="ai-icon">
+                                    <span class="fas fa-brain"></span>
+                                </div>
+                                <div class="ai-title">🤖 AI生态顾问</div>
+                            </div>
+                            <div class="voice-controls">
+                                <button class="voice-btn" id="voice-input-btn" title="语音输入">
+                                    <span class="fas fa-microphone"></span>
+                                </button>
+                                <button class="voice-btn" id="voice-output-toggle" title="切换语音输出">
+                                    <span class="fas fa-volume-up"></span>
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div class="voice-status">
+                            <div class="voice-indicator" id="voice-indicator"></div>
+                            <span id="voice-status-text">语音助手已就绪</span>
+                        </div>
+                        
+                        <div class="chat-container" id="chat-container">
+                            <div class="message ai-message">
+                                <div class="message-content">
+                                    您好！我是您的AI生态顾问，专门帮助您管理和优化微型生态室环境。请随时向我咨询生态治理相关问题！
+                                    
+                                    <div style="margin-top: 15px; padding: 10px; background: rgba(76, 175, 80, 0.2); border-radius: 8px;">
+                                        <strong>💡 使用提示：</strong><br>
+                                        您可以问我：<br>
+                                        • 当前室内外环境是否适合植物生长？<br>
+                                        • 如何根据天气调整通风策略？<br>
+                                        • 宁波的天气对生态室有什么影响？<br>
+                                        • 如何改善生物多样性？
+                                    </div>
+                                </div>
+                                <div class="message-time">现在</div>
+                            </div>
+                        </div>
+                        
+                        <div class="chat-input">
+                            <textarea id="chat-message" placeholder="输入您的问题，例如：如何根据宁波的天气优化生态室？..."></textarea>
+                            <div class="chat-buttons">
+                                <button id="send-chat">
+                                    <span class="fas fa-paper-plane"></span>
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div class="thinking" id="thinking" style="display: none;">
+                            <span>AI思考中</span>
+                            <span class="dot"></span>
+                            <span class="dot"></span>
+                            <span class="dot"></span>
+                        </div>
+                        
+                        <div class="ai-suggestions">
+                            <button class="suggestion-btn" data-question="当前室内外环境匹配度如何？">环境匹配</button>
+                            <button class="suggestion-btn" data-question="宁波的天气对生态室有什么影响？">天气影响</button>
+                            <button class="suggestion-btn" data-question="如何根据室外温度调整通风？">通风优化</button>
+                            <button class="suggestion-btn" data-question="如何模拟宁波的自然生态环境？">生态模拟</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+        
+        <footer class="status-bar">
+            <div class="status-item">
+                <span class="status-icon"><span class="fas fa-mobile-alt"></span></span>
+                <span class="status-text">系统状态:</span>
+                <span class="status-value good" id="system-status">运行中</span>
+            </div>
+            <div class="status-item">
+                <span class="status-icon"><span class="fas fa-clock"></span></span>
+                <span class="status-text">最后更新:</span>
+                <span class="status-value" id="last-update">--:--:--</span>
+            </div>
+            <div class="status-item">
+                <span class="status-icon"><span class="fas fa-wifi"></span></span>
+                <span class="status-text">连接状态:</span>
+                <span class="status-value good" id="connection-status">在线</span>
+            </div>
+        </footer>
+    </div>
+    
+    <div class="notification" id="notification">
+        <span class="fas fa-check-circle"></span>
+        <span class="notification-text">系统通知</span>
+    </div>
+    
+    <script>
+        // 配置marked.js
+        marked.setOptions({
+            breaks: true,
+            gfm: true,
+            sanitize: false,
+            smartLists: true,
+            smartypants: true,
+            xhtml: true,
+            highlight: function(code, lang) {
+                if (lang && lang.toLowerCase() === 'ecological') {
+                    return `<span class="ai-ecological">${code}</span>`;
+                }
+                return code;
+            }
+        });
+        
+        // 语音功能状态
+        let isListening = false;
+        let recognition;
+        let synth = window.speechSynthesis;
+        let isVoiceOutputEnabled = true;
+        let voices = [];
+        let speechQueue = [];
+        let isSpeaking = false;
+        
+        // 环境参数适宜范围
+        const ENVIRONMENT_RANGES = {
+            temperature: { min: 20, max: 30, weight: 0.25 },
+            humidity: { min: 40, max: 80, weight: 0.25 },
+            light: { min: 500, max: 2000, weight: 0.25 },
+            weather: { weight: 0.25 }
+        };
+        
+        // 天气条件到图标的映射
+        const WEATHER_ICONS = {
+            '晴': 'fa-sun weather-icon-sunny',
+            '多云': 'fa-cloud weather-icon-cloudy',
+            '阴': 'fa-cloud weather-icon-cloudy',
+            '小雨': 'fa-cloud-rain weather-icon-rainy',
+            '中雨': 'fa-cloud-showers-heavy weather-icon-rainy',
+            '大雨': 'fa-cloud-showers-heavy weather-icon-rainy',
+            '暴雨': 'fa-bolt weather-icon-storm',
+            '小雪': 'fa-snowflake weather-icon-snowy',
+            '中雪': 'fa-snowflake weather-icon-snowy',
+            '大雪': 'fa-snowflake weather-icon-snowy',
+            '雾': 'fa-smog weather-icon-cloudy',
+            '霾': 'fa-smog weather-icon-cloudy'
+        };
+        
+        // 检查浏览器语音支持
+        function checkVoiceSupport() {
+            const voiceStatus = document.getElementById('voice-status-text');
+            const voiceIndicator = document.getElementById('voice-indicator');
+            
+            if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+                // 初始化语音识别
+                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                recognition = new SpeechRecognition();
+                recognition.continuous = false;
+                recognition.interimResults = false;
+                recognition.lang = 'zh-CN';
+                
+                // 语音识别事件
+                recognition.onstart = function() {
+                    isListening = true;
+                    voiceStatus.textContent = '正在聆听...';
+                    voiceIndicator.classList.add('active');
+                    document.getElementById('voice-input-btn').classList.add('recording');
+                };
+                
+                recognition.onend = function() {
+                    isListening = false;
+                    voiceStatus.textContent = '语音助手已就绪';
+                    voiceIndicator.classList.remove('active');
+                    document.getElementById('voice-input-btn').classList.remove('recording');
+                };
+                
+                recognition.onresult = function(event) {
+                    const transcript = event.results[0][0].transcript;
+                    console.log('识别结果:', transcript);
+                    
+                    // 将识别结果填入输入框并发送
+                    document.getElementById('chat-message').value = transcript;
+                    sendChatMessage();
+                };
+                
+                recognition.onerror = function(event) {
+                    console.error('语音识别错误:', event.error);
+                    isListening = false;
+                    voiceStatus.textContent = '语音识别错误，请重试';
+                    voiceIndicator.classList.remove('active');
+                    document.getElementById('voice-input-btn').classList.remove('recording');
+                    showNotification('语音识别错误: ' + event.error, 'error');
+                };
+                
+                voiceStatus.textContent = '语音输入已就绪';
+                voiceIndicator.style.background = 'var(--success-color)';
+                
+                // 获取可用的语音
+                getVoices();
+            } else {
+                voiceStatus.textContent = '浏览器不支持语音识别';
+                voiceIndicator.style.background = 'var(--danger-color)';
+                document.getElementById('voice-input-btn').disabled = true;
+                document.getElementById('voice-output-toggle').disabled = true;
+                showNotification('您的浏览器不支持语音功能，请使用最新版Chrome或Edge', 'error');
+            }
+        }
+        
+        // 获取可用的语音
+        function getVoices() {
+            voices = synth.getVoices();
+            
+            // 如果没有语音，等待voiceschanged事件
+            if (voices.length === 0) {
+                synth.onvoiceschanged = function() {
+                    voices = synth.getVoices();
+                    console.log('可用的语音:', voices);
+                };
+            } else {
+                console.log('可用的语音:', voices);
+            }
+            
+            // 设置默认语音
+            synth.onvoiceschanged = function() {
+                voices = synth.getVoices();
+                console.log('语音列表更新:', voices);
+            };
+        }
+        
+        // 语音合成
+        function speakText(text, force = false) {
+            if (!isVoiceOutputEnabled && !force) return;
+            
+            // 如果已经在说话，将文本加入队列
+            if (isSpeaking) {
+                speechQueue.push(text);
+                return;
+            }
+            
+            isSpeaking = true;
+            
+            // 创建语音对象
+            const utterance = new SpeechSynthesisUtterance(text);
+            
+            // 设置中文语音
+            const chineseVoices = voices.filter(voice => 
+                voice.lang.includes('zh') || 
+                voice.name.includes('Chinese') || 
+                voice.name.includes('Mandarin')
+            );
+            
+            if (chineseVoices.length > 0) {
+                utterance.voice = chineseVoices[0];
+            }
+            
+            utterance.rate = 0.9; // 语速
+            utterance.pitch = 1.0; // 音调
+            utterance.volume = 1.0; // 音量
+            
+            utterance.onend = function() {
+                isSpeaking = false;
+                // 处理队列中的下一条语音
+                if (speechQueue.length > 0) {
+                    const nextText = speechQueue.shift();
+                    speakText(nextText);
+                }
+            };
+            
+            utterance.onerror = function(event) {
+                console.error('语音合成错误:', event.error);
+                isSpeaking = false;
+                if (speechQueue.length > 0) {
+                    const nextText = speechQueue.shift();
+                    speakText(nextText);
+                }
+            };
+            
+            synth.speak(utterance);
+        }
+        
+        // 切换语音输出
+        function toggleVoiceOutput() {
+            isVoiceOutputEnabled = !isVoiceOutputEnabled;
+            const btn = document.getElementById('voice-output-toggle');
+            
+            if (isVoiceOutputEnabled) {
+                btn.innerHTML = '<span class="fas fa-volume-up"></span>';
+                btn.style.background = 'var(--voice-color)';
+                showNotification('语音输出已启用', 'voice');
+            } else {
+                btn.innerHTML = '<span class="fas fa-volume-mute"></span>';
+                btn.style.background = 'var(--danger-color)';
+                synth.cancel(); // 停止当前所有语音
+                speechQueue = []; // 清空队列
+                showNotification('语音输出已禁用', 'voice');
+            }
+        }
+        
+        // 启动语音识别
+        function startVoiceRecognition() {
+            if (isListening) {
+                recognition.stop();
+                return;
+            }
+            
+            try {
+                recognition.start();
+            } catch (error) {
+                console.error('启动语音识别失败:', error);
+                showNotification('语音识别启动失败: ' + error.message, 'error');
+            }
+        }
+        
+        // 计算环境评分
+        function calculateEnvironmentScore(data, weatherData) {
+            let totalScore = 0;
+            let parameterStatus = {
+                temperature: 'good',
+                humidity: 'good',
+                light: 'good',
+                weather: 'good'
+            };
+            
+            // 温度评分
+            const tempRange = ENVIRONMENT_RANGES.temperature;
+            let tempScore = 100;
+            if (data.temperature < tempRange.min) {
+                tempScore = Math.max(0, 100 - ((tempRange.min - data.temperature) / tempRange.min * 100));
+                parameterStatus.temperature = tempScore < 60 ? 'danger' : tempScore < 80 ? 'warning' : 'poor';
+            } else if (data.temperature > tempRange.max) {
+                tempScore = Math.max(0, 100 - ((data.temperature - tempRange.max) / tempRange.max * 100));
+                parameterStatus.temperature = tempScore < 60 ? 'danger' : tempScore < 80 ? 'warning' : 'poor';
+            }
+            totalScore += tempScore * tempRange.weight;
+            
+            // 湿度评分
+            const humidityRange = ENVIRONMENT_RANGES.humidity;
+            let humidityScore = 100;
+            if (data.humidity < humidityRange.min) {
+                humidityScore = Math.max(0, 100 - ((humidityRange.min - data.humidity) / humidityRange.min * 100));
+                parameterStatus.humidity = humidityScore < 60 ? 'danger' : humidityScore < 80 ? 'warning' : 'poor';
+            } else if (data.humidity > humidityRange.max) {
+                humidityScore = Math.max(0, 100 - ((data.humidity - humidityRange.max) / humidityRange.max * 100));
+                parameterStatus.humidity = humidityScore < 60 ? 'danger' : humidityScore < 80 ? 'warning' : 'poor';
+            }
+            totalScore += humidityScore * humidityRange.weight;
+            
+            // 光照评分
+            const lightRange = ENVIRONMENT_RANGES.light;
+            let lightScore = 100;
+            if (data.light_level < lightRange.min) {
+                lightScore = Math.max(0, 100 - ((lightRange.min - data.light_level) / lightRange.min * 100));
+                parameterStatus.light = lightScore < 60 ? 'danger' : lightScore < 80 ? 'warning' : 'poor';
+            } else if (data.light_level > lightRange.max) {
+                lightScore = Math.max(0, 100 - ((data.light_level - lightRange.max) / lightRange.max * 100));
+                parameterStatus.light = lightScore < 60 ? 'danger' : lightScore < 80 ? 'warning' : 'poor';
+            }
+            totalScore += lightScore * lightRange.weight;
+            
+            // 天气协同评分
+            let weatherScore = 100;
+            let weatherStatus = 'good';
+            
+            // 基于天气条件的调整
+            const weatherCondition = weatherData.condition;
+            const tempDiff = Math.abs(data.temperature - weatherData.temperature);
+            const humidityDiff = Math.abs(data.humidity - weatherData.humidity);
+            
+            // 温度差异评分
+            if (tempDiff > 10) {
+                weatherScore -= 30;
+                weatherStatus = 'poor';
+            } else if (tempDiff > 5) {
+                weatherScore -= 15;
+                if (weatherStatus === 'good') weatherStatus = 'warning';
+            }
+            
+            // 湿度差异评分
+            if (humidityDiff > 30) {
+                weatherScore -= 30;
+                weatherStatus = 'poor';
+            } else if (humidityDiff > 15) {
+                weatherScore -= 15;
+                if (weatherStatus === 'good') weatherStatus = 'warning';
+            }
+            
+            // 天气条件评分
+            if (weatherCondition.includes('雨') || 
+                weatherCondition.includes('雪') || 
+                weatherCondition.includes('暴') || 
+                weatherCondition.includes('雷')) {
+                weatherScore -= 20;
+                if (weatherStatus === 'good') weatherStatus = 'warning';
+            }
+            
+            weatherScore = Math.max(0, weatherScore);
+            parameterStatus.weather = weatherScore < 60 ? 'danger' : weatherScore < 80 ? 'warning' : weatherStatus;
+            
+            totalScore += weatherScore * ENVIRONMENT_RANGES.weather.weight;
+            
+            // 确定整体状态
+            let overallStatus = 'excellent';
+            if (tempScore < 60 || humidityScore < 60 || lightScore < 60 || weatherScore < 60) {
+                overallStatus = 'danger';
+            } else if (tempScore < 80 || humidityScore < 80 || lightScore < 80 || weatherScore < 80) {
+                overallStatus = 'warning';
+            } else if (tempScore < 90 || humidityScore < 90 || lightScore < 90 || weatherScore < 90) {
+                overallStatus = 'okay';
+            } else if (totalScore < 95) {
+                overallStatus = 'good';
+            }
+            
+            return {
+                score: Math.round(totalScore),
+                status: overallStatus,
+                parameters: parameterStatus,
+                weatherStatus: weatherStatus
+            };
+        }
+        
+        // 更新环境背景
+        function updateEnvironmentBackground(scoreData) {
+            const body = document.body;
+            const statusBar = document.querySelector('.environment-status-bar');
+            const statusText = document.querySelector('.environment-status-text .status-text');
+            const statusIndicator = document.querySelector('.environment-indicator');
+            const scoreElement = document.getElementById('environment-score');
+            const scoreFill = document.getElementById('environment-score-fill');
+            const descriptionElement = document.getElementById('environment-description');
+            const recommendationsElement = document.getElementById('environment-recommendations');
+            
+            // 移除所有环境状态类
+            body.className = '';
+            statusBar.style.setProperty('--status-color-start', '#4CAF50');
+            statusBar.style.setProperty('--status-color-end', '#2E7D32');
+            statusIndicator.style.background = '#4CAF50';
+            
+            // 根据评分设置背景
+            let statusTextContent = "环境状态: ";
+            let description = "";
+            let recommendations = "";
+            
+            if (scoreData.score >= 95) {
+                body.classList.add('environment-excellent');
+                statusBar.style.setProperty('--status-color-start', '#2E7D32');
+                statusBar.style.setProperty('--status-color-end', '#1B5E20');
+                statusIndicator.style.background = '#2E7D32';
+                statusTextContent += "优秀";
+                description = "室内外环境协同最佳，生态系统处于最佳状态！";
+                recommendations = `
+                    <div class="recommendation-title">🔧 优化建议</div>
+                    <ul class="recommendation-list">
+                        <li>保持当前设置，室外天气适宜，可适当增加通风</li>
+                        <li>利用室外良好天气条件，增强室内生物多样性</li>
+                        <li>记录生态系统数据，分析室内外环境协同效应</li>
+                    </ul>
+                `;
+            } else if (scoreData.score >= 85) {
+                body.classList.add('environment-good');
+                statusBar.style.setProperty('--status-color-start', '#4CAF50');
+                statusBar.style.setProperty('--status-color-end', '#2E7D32');
+                statusIndicator.style.background = '#4CAF50';
+                statusTextContent += "良好";
+                description = "室内外环境匹配度高，生态系统健康稳定。";
+                recommendations = `
+                    <div class="recommendation-title">🔧 优化建议</div>
+                    <ul class="recommendation-list">
+                        <li>微调通风系统，提高室内外空气交换效率</li>
+                        <li>根据室外天气变化，适时调整照明强度</li>
+                        <li>观察植物生长状态，优化环境参数</li>
+                    </ul>
+                `;
+            } else if (scoreData.score >= 70) {
+                body.classList.add('environment-okay');
+                statusBar.style.setProperty('--status-color-start', '#8BC34A');
+                statusBar.style.setProperty('--status-color-end', '#558B2F');
+                statusIndicator.style.background = '#8BC34A';
+                statusTextContent += "合格";
+                description = "室内外环境基本匹配，需进一步优化以提升生态质量。";
+                recommendations = `
+                    <div class="recommendation-title">🔧 优化建议</div>
+                    <ul class="recommendation-list">
+                        <li>根据室外温度湿度，调整室内环境参数</li>
+                        <li>增加通风频率，改善空气流通</li>
+                        <li>利用自然光照，减少人工照明能耗</li>
+                    </ul>
+                `;
+            } else if (scoreData.score >= 50) {
+                body.classList.add('environment-warning');
+                statusBar.style.setProperty('--status-color-start', '#FFC107');
+                statusBar.style.setProperty('--status-color-end', '#FFA000');
+                statusIndicator.style.background = '#FFC107';
+                statusTextContent += "警告";
+                description = "室内外环境差异较大，需要及时调整以避免生态失衡。";
+                recommendations = `
+                    <div class="recommendation-title">🔧 优化建议</div>
+                    <ul class="recommendation-list">
+                        <li>立即调整通风策略，降低室内外温湿度差异</li>
+                        <li>根据室外天气，重新设置室内照明方案</li>
+                        <li>监测植物应激反应，提供应急保护措施</li>
+                        <li>考虑安装遮阳或保温设施，减小环境波动</li>
+                    </ul>
+                `;
+            } else if (scoreData.score >= 30) {
+                body.classList.add('environment-poor');
+                statusBar.style.setProperty('--status-color-start', '#FF9800');
+                statusBar.style.setProperty('--status-color-end', '#F57C00');
+                statusIndicator.style.background = '#FF9800';
+                statusTextContent += "不良";
+                description = "室内外环境严重不匹配，生态系统面临风险。";
+                recommendations = `
+                    <div class="recommendation-title">🔧 优化建议</div>
+                    <ul class="recommendation-list">
+                        <li>启动应急调节系统，确保生物安全</li>
+                        <li>减少室内外空气交换，维持稳定环境</li>
+                        <li>调整照明为恒定模式，避免环境剧烈变化</li>
+                        <li>联系生态专家获取专业建议</li>
+                    </ul>
+                `;
+            } else {
+                body.classList.add('environment-danger');
+                statusBar.style.setProperty('--status-color-start', '#F44336');
+                statusBar.style.setProperty('--status-color-end', '#C62828');
+                statusIndicator.style.background = '#F44336';
+                statusTextContent += "危险";
+                description = "室内外环境极度不匹配，生态系统面临崩溃风险，必须立即采取紧急措施！";
+                recommendations = `
+                    <div class="recommendation-title">🔧 优化建议</div>
+                    <ul class="recommendation-list">
+                        <li>立即启动环境隔离模式，切断室内外空气交换</li>
+                        <li>启用备用温控系统，维持室内环境稳定</li>
+                        <li>转移敏感生物到避难环境</li>
+                        <li>联系生态修复专业团队进行紧急处理</li>
+                    </ul>
+                `;
+            }
+            
+            // 更新UI
+            scoreElement.textContent = scoreData.score;
+            scoreFill.style.width = `${scoreData.score}%`;
+            scoreFill.style.background = `linear-gradient(90deg, ${statusBar.style.getPropertyValue('--status-color-start')}, ${statusBar.style.getPropertyValue('--status-color-end')})`;
+            descriptionElement.textContent = description;
+            recommendationsElement.innerHTML = recommendations;
+            statusText.textContent = statusTextContent;
+            
+            // 为参数卡片添加状态类
+            const params = ['temperature', 'humidity', 'light'];
+            params.forEach(param => {
+                const element = document.getElementById(`${param}-value`);
+                if (element) {
+                    element.className = '';
+                    element.classList.add(`status-${scoreData.parameters[param]}`);
+                }
+            });
+        }
+        
+        // 更新天气UI
+        function updateWeatherUI(weatherData) {
+            if (!weatherData) return;
+            
+            // 更新天气条件
+            const conditionElement = document.getElementById('weather-condition');
+            const iconElement = document.querySelector('.weather-card .card-icon i');
+            
+            conditionElement.textContent = weatherData.condition;
+            
+            // 更新天气图标
+            const iconClass = WEATHER_ICONS[weatherData.condition] || 'fa-cloud weather-icon-cloudy';
+            iconElement.className = `fas ${iconClass}`;
+            
+            // 更新温度和湿度
+            document.getElementById('weather-temperature').textContent = `${weatherData.temperature}°C`;
+            document.getElementById('weather-humidity').textContent = `室外湿度: ${weatherData.humidity}%`;
+            document.getElementById('weather-temp-detail').textContent = `${weatherData.temperature}°C`;
+            document.getElementById('weather-humidity-detail').textContent = `${weatherData.humidity}%`;
+        }
+        
+        // 初始化图表
+        const ctx = document.getElementById('data-chart').getContext('2d');
+        const dataChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: '室内温度 (°C)',
+                        data: [],
+                        borderColor: '#4CAF50',
+                        backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                        tension: 0.3,
+                        fill: true,
+                        pointRadius: 3,
+                        pointBackgroundColor: '#4CAF50'
+                    },
+                    {
+                        label: '室外温度 (°C)',
+                        data: [],
+                        borderColor: '#3498db',
+                        backgroundColor: 'rgba(52, 152, 219, 0.1)',
+                        tension: 0.3,
+                        fill: false,
+                        pointRadius: 3,
+                        pointBackgroundColor: '#3498db'
+                    },
+                    {
+                        label: '室内湿度 (%)',
+                        data: [],
+                        borderColor: '#2196F3',
+                        backgroundColor: 'rgba(33, 150, 243, 0.1)',
+                        tension: 0.3,
+                        fill: true,
+                        pointRadius: 3,
+                        pointBackgroundColor: '#2196F3'
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: false,
+                        grid: {
+                            color: 'rgba(255, 255, 255, 0.1)'
+                        },
+                        ticks: {
+                            color: '#fff'
+                        }
+                    },
+                    x: {
+                        grid: {
+                            color: 'rgba(255, 255, 255, 0.1)'
+                        },
+                        ticks: {
+                            color: '#fff'
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        labels: {
+                            color: '#fff',
+                            font: {
+                                size: 12
+                            }
+                        }
+                    },
+                    tooltip: {
+                        mode: 'index',
+                        intersect: false
+                    }
+                },
+                animation: {
+                    duration: 1000
+                },
+                interaction: {
+                    mode: 'nearest',
+                    axis: 'x',
+                    intersect: false
+                }
+            }
+        });
+        
+        // Socket.IO 连接
+        const socket = io();
+        let chatHistoryLoaded = false;
+        
+        socket.on('connect', function() {
+            console.log('Connected to server');
+            document.getElementById('connection-status').textContent = '在线';
+            document.getElementById('connection-status').className = 'status-value good';
+            showNotification('已成功连接到生态监控系统', 'success');
+            
+            // 加载聊天历史
+            loadChatHistory();
+        });
+        
+        socket.on('disconnect', function() {
+            console.log('Disconnected from server');
+            document.getElementById('connection-status').textContent = '离线';
+            document.getElementById('connection-status').className = 'status-value warning';
+            showNotification('与服务器的连接已断开', 'error');
+        });
+        
+        socket.on('sensor_data', function(data) {
+            updateSensorData(data);
+        });
+        
+        // 更新传感器数据
+        function updateSensorData(data) {
+            // 更新显示
+            document.getElementById('temperature-value').textContent = `${data.temperature}°C`;
+            document.getElementById('humidity-value').textContent = `${data.humidity}%`;
+            document.getElementById('light-value').textContent = `${data.light_level} lux`;
+            
+            // 更新天气数据
+            const weatherData = {
+                condition: data.weather_condition,
+                temperature: data.weather_temperature,
+                humidity: data.weather_humidity,
+                city: data.weather_city
+            };
+            
+            updateWeatherUI(weatherData);
+            
+            document.getElementById('last-update').textContent = data.timestamp;
+            
+            // 更新进度条
+            const tempProgress = Math.min(100, Math.max(0, (data.temperature - 20) / 10 * 100));
+            document.getElementById('temperature-progress').style.width = `${tempProgress}%`;
+            document.getElementById('temperature-percent').textContent = Math.round(tempProgress);
+            
+            const humidityProgress = Math.min(100, Math.max(0, data.humidity));
+            document.getElementById('humidity-progress').style.width = `${humidityProgress}%`;
+            document.getElementById('humidity-percent').textContent = Math.round(humidityProgress);
+            
+            const lightProgress = Math.min(100, Math.max(0, data.light_level / 2000 * 100));
+            document.getElementById('light-progress').style.width = `${lightProgress}%`;
+            document.getElementById('light-percent').textContent = Math.round(lightProgress);
+            
+            // 计算环境评分并更新背景
+            const scoreData = calculateEnvironmentScore(data, weatherData);
+            updateEnvironmentBackground(scoreData);
+            
+            // 更新图表
+            updateChartData(data, weatherData);
+        }
+        
+        // 更新图表数据
+        function updateChartData(data, weatherData) {
+            const now = new Date();
+            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+            
+            // 只保留最近60个数据点
+            if (dataChart.data.labels.length > 60) {
+                dataChart.data.labels.shift();
+                dataChart.data.datasets[0].data.shift();
+                dataChart.data.datasets[1].data.shift();
+                dataChart.data.datasets[2].data.shift();
+            }
+            
+            dataChart.data.labels.push(timeStr);
+            dataChart.data.datasets[0].data.push(data.temperature);
+            dataChart.data.datasets[1].data.push(weatherData.temperature);
+            dataChart.data.datasets[2].data.push(data.humidity);
+            
+            dataChart.update();
+        }
+        
+        // 通风控制
+        document.getElementById('ventilation-slider').addEventListener('input', function() {
+            const speed = this.value;
+            document.getElementById('vent-slider-value').textContent = `${speed}%`;
+            
+            if (speed > 0) {
+                document.getElementById('vent-status').textContent = '运行中';
+                document.getElementById('vent-status').className = 'status-value active';
+                if (document.getElementById('vent-button').innerHTML.includes('启动')) {
+                    document.getElementById('vent-button').innerHTML = '<span class="fas fa-wind"></span><span>停止通风</span>';
+                    document.getElementById('vent-button').classList.add('active');
+                }
+            } else {
+                document.getElementById('vent-status').textContent = '关闭';
+                document.getElementById('vent-status').className = 'status-value';
+                if (document.getElementById('vent-button').innerHTML.includes('停止')) {
+                    document.getElementById('vent-button').innerHTML = '<span class="fas fa-wind"></span><span>启动通风</span>';
+                    document.getElementById('vent-button').classList.remove('active');
+                }
+            }
+            
+            // 发送控制命令
+            fetch('/api/control/ventilation', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    ventilation_on: speed > 0,
+                    speed: parseInt(speed)
+                })
+            });
+        });
+        
+        document.getElementById('vent-button').addEventListener('click', function() {
+            const isRunning = document.getElementById('vent-status').textContent === '运行中';
+            const slider = document.getElementById('ventilation-slider');
+            
+            if (isRunning) {
+                slider.value = 0;
+                document.getElementById('vent-slider-value').textContent = '0%';
+                document.getElementById('vent-status').textContent = '关闭';
+                document.getElementById('vent-status').className = 'status-value';
+                this.innerHTML = '<span class="fas fa-wind"></span><span>启动通风</span>';
+                this.classList.remove('active');
+            } else {
+                slider.value = 50;
+                document.getElementById('vent-slider-value').textContent = '50%';
+                document.getElementById('vent-status').textContent = '运行中';
+                document.getElementById('vent-status').className = 'status-value active';
+                this.innerHTML = '<span class="fas fa-wind"></span><span>停止通风</span>';
+                this.classList.add('active');
+            }
+            
+            // 发送控制命令
+            fetch('/api/control/ventilation', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    ventilation_on: !isRunning,
+                    speed: !isRunning ? 50 : 0
+                })
+            });
+        });
+        
+        // 通风自动模式
+        document.getElementById('vent-auto-button').addEventListener('click', function() {
+            showNotification('已启动通风系统自动模式，将根据室内外温湿度自动调节', 'success');
+        });
+        
+        // 照明控制
+        document.getElementById('lighting-slider').addEventListener('input', function() {
+            const brightness = this.value;
+            document.getElementById('light-slider-value').textContent = `${brightness}%`;
+            
+            if (brightness > 0) {
+                document.getElementById('light-status').textContent = '开启';
+                document.getElementById('light-status').className = 'status-value active';
+                if (document.getElementById('light-button').innerHTML.includes('开启')) {
+                    document.getElementById('light-button').innerHTML = '<span class="fas fa-lightbulb"></span><span>关闭照明</span>';
+                    document.getElementById('light-button').classList.add('active');
+                }
+            } else {
+                document.getElementById('light-status').textContent = '关闭';
+                document.getElementById('light-status').className = 'status-value';
+                if (document.getElementById('light-button').innerHTML.includes('关闭')) {
+                    document.getElementById('light-button').innerHTML = '<span class="fas fa-lightbulb"></span><span>开启照明</span>';
+                    document.getElementById('light-button').classList.remove('active');
+                }
+            }
+            
+            // 发送控制命令
+            fetch('/api/control/lighting', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    lighting_on: brightness > 0,
+                    brightness: parseInt(brightness)
+                })
+            });
+        });
+        
+        document.getElementById('light-button').addEventListener('click', function() {
+            const isOn = document.getElementById('light-status').textContent === '开启';
+            const slider = document.getElementById('lighting-slider');
+            
+            if (isOn) {
+                slider.value = 0;
+                document.getElementById('light-slider-value').textContent = '0%';
+                document.getElementById('light-status').textContent = '关闭';
+                document.getElementById('light-status').className = 'status-value';
+                this.innerHTML = '<span class="fas fa-lightbulb"></span><span>开启照明</span>';
+                this.classList.remove('active');
+            } else {
+                slider.value = 70;
+                document.getElementById('light-slider-value').textContent = '70%';
+                document.getElementById('light-status').textContent = '开启';
+                document.getElementById('light-status').className = 'status-value active';
+                this.innerHTML = '<span class="fas fa-lightbulb"></span><span>关闭照明</span>';
+                this.classList.add('active');
+            }
+            
+            // 发送控制命令
+            fetch('/api/control/lighting', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    lighting_on: !isOn,
+                    brightness: !isOn ? 70 : 0
+                })
+            });
+        });
+        
+        // 照明自动模式
+        document.getElementById('light-auto-button').addEventListener('click', function() {
+            showNotification('已启动照明系统自动模式，将根据室外光照强度自动调节', 'success');
+        });
+        
+        // AI聊天功能
+        document.getElementById('send-chat').addEventListener('click', sendChatMessage);
+        document.getElementById('chat-message').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendChatMessage();
+            }
+        });
+        
+        // 语音控制按钮
+        document.getElementById('voice-input-btn').addEventListener('click', startVoiceRecognition);
+        document.getElementById('voice-output-toggle').addEventListener('click', toggleVoiceOutput);
+        
+        // 建议按钮
+        document.querySelectorAll('.suggestion-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                const question = this.getAttribute('data-question');
+                document.getElementById('chat-message').value = question;
+                sendChatMessage();
+            });
+        });
+        
+        // 消息操作按钮
+        function setupMessageActions() {
+            // 为现有消息添加操作按钮
+            document.querySelectorAll('.message').forEach(message => {
+                if (!message.querySelector('.message-actions')) {
+                    const actionsDiv = document.createElement('div');
+                    actionsDiv.className = 'message-actions';
+                    
+                    // 语音按钮
+                    const voiceBtn = document.createElement('button');
+                    voiceBtn.className = 'action-btn';
+                    voiceBtn.innerHTML = '<span class="fas fa-volume-up"></span>';
+                    voiceBtn.title = '语音播报';
+                    voiceBtn.addEventListener('click', function() {
+                        const content = message.querySelector('.message-content').textContent;
+                        speakText(content, true);
+                    });
+                    
+                    // 复制按钮
+                    const copyBtn = document.createElement('button');
+                    copyBtn.className = 'action-btn';
+                    copyBtn.innerHTML = '<span class="fas fa-copy"></span>';
+                    copyBtn.title = '复制内容';
+                    copyBtn.addEventListener('click', function() {
+                        const content = message.querySelector('.message-content').textContent;
+                        navigator.clipboard.writeText(content).then(() => {
+                            showNotification('内容已复制到剪贴板', 'success');
+                        });
+                    });
+                    
+                    actionsDiv.appendChild(voiceBtn);
+                    actionsDiv.appendChild(copyBtn);
+                    message.appendChild(actionsDiv);
+                }
+            });
+        }
+        
+        function sendChatMessage() {
+            const messageInput = document.getElementById('chat-message');
+            const message = messageInput.value.trim();
+            
+            if (!message) return;
+            
+            // 添加用户消息到聊天界面
+            addMessageToChat(message, 'user');
+            
+            // 清空输入框
+            messageInput.value = '';
+            
+            // 显示思考状态
+            document.getElementById('thinking').style.display = 'flex';
+            document.getElementById('send-chat').disabled = true;
+            
+            // 发送到后端
+            fetch('/api/chat', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ message: message })
             })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    // 添加AI回复到聊天界面（支持Markdown）
+                    addMessageToChat(data.response, 'ai', true);
+                    
+                    // 语音输出AI回复
+                    if (isVoiceOutputEnabled) {
+                        // 提取纯文本用于语音
+                        const tempElement = document.createElement('div');
+                        tempElement.innerHTML = DOMPurify.sanitize(marked.parse(data.response));
+                        const cleanText = tempElement.textContent || tempElement.innerText || '';
+                        speakText(cleanText);
+                    }
+                } else {
+                    addMessageToChat('抱歉，我遇到了一些问题。请稍后再试。', 'ai');
+                    showNotification('AI回复失败: ' + (data.error || '未知错误'), 'error');
+                }
+            })
+            .catch(error => {
+                console.error('聊天请求失败:', error);
+                addMessageToChat('网络连接失败，请检查网络连接。', 'ai');
+                showNotification('网络错误: 无法连接到AI服务', 'error');
+            })
+            .finally(() => {
+                // 隐藏思考状态
+                document.getElementById('thinking').style.display = 'none';
+                document.getElementById('send-chat').disabled = false;
+                
+                // 设置消息操作按钮
+                setupMessageActions();
+            });
+        }
+        
+        function addMessageToChat(content, sender, isMarkdown = false) {
+            const chatContainer = document.getElementById('chat-container');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${sender}-message`;
             
-            return "OK"
-        else:
-            return "Error: Missing parameters", 400
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
             
-    except Exception as e:
-        print(f"处理传感器数据失败: {e}")
-        return f"Error: {str(e)}", 500
-
-@app.route('/command', methods=['GET'])
-def get_command():
-    """向主控板发送控制命令 - 硬件接口"""
-    try:
-        # 根据当前系统状态决定命令
-        cmd = "off"  # 默认关闭
+            if (isMarkdown && sender === 'ai') {
+                // 先渲染Markdown，然后用DOMPurify净化
+                const htmlContent = marked.parse(content);
+                contentDiv.innerHTML = DOMPurify.sanitize(htmlContent, {
+                    ALLOWED_TAGS: [
+                        'div', 'p', 'span', 'strong', 'em', 'code', 'pre', 'ul', 'ol', 'li', 
+                        'table', 'thead', 'tbody', 'tr', 'th', 'td', 'blockquote', 'h1', 'h2', 
+                        'h3', 'h4', 'h5', 'h6', 'br', 'hr', 'a', 'img'
+                    ],
+                    ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'class', 'style'],
+                    FORBID_ATTR: ['style'],
+                    FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form', 'input']
+                });
+            } else {
+                contentDiv.textContent = content;
+            }
+            
+            const timeDiv = document.createElement('div');
+            timeDiv.className = 'message-time';
+            const now = new Date();
+            timeDiv.textContent = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+            
+            messageDiv.appendChild(contentDiv);
+            messageDiv.appendChild(timeDiv);
+            
+            // 为AI消息添加操作按钮
+            if (sender === 'ai') {
+                const actionsDiv = document.createElement('div');
+                actionsDiv.className = 'message-actions';
+                
+                const voiceBtn = document.createElement('button');
+                voiceBtn.className = 'action-btn';
+                voiceBtn.innerHTML = '<span class="fas fa-volume-up"></span>';
+                voiceBtn.title = '语音播报';
+                voiceBtn.addEventListener('click', function() {
+                    speakText(content, true);
+                });
+                
+                const copyBtn = document.createElement('button');
+                copyBtn.className = 'action-btn';
+                copyBtn.innerHTML = '<span class="fas fa-copy"></span>';
+                copyBtn.title = '复制内容';
+                copyBtn.addEventListener('click', function() {
+                    navigator.clipboard.writeText(content).then(() => {
+                        showNotification('内容已复制到剪贴板', 'success');
+                    });
+                });
+                
+                actionsDiv.appendChild(voiceBtn);
+                actionsDiv.appendChild(copyBtn);
+                messageDiv.appendChild(actionsDiv);
+            }
+            
+            chatContainer.appendChild(messageDiv);
+            
+            // 滚动到底部
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
         
-        # 如果通风系统开启，发送开启命令
-        if eco_system.ventilation_active and eco_system.ventilation_speed > 0:
-            cmd = "vent_on"
-        # 如果照明系统开启，发送开启命令
-        elif eco_system.lighting_active:
-            cmd = "light_on"
-        # 如果两者都关闭，发送关闭命令
-        else:
-            cmd = "off"
+        function loadChatHistory() {
+            if (chatHistoryLoaded) return;
+            
+            fetch('/api/chat/history')
+                .then(response => response.json())
+                .then(data => {
+                    const chatContainer = document.getElementById('chat-container');
+                    chatContainer.innerHTML = ''; // 清空初始消息
+                    
+                    data.history.forEach(item => {
+                        addMessageToChat(item.user, 'user');
+                        addMessageToChat(item.ai, 'ai', true);
+                    });
+                    
+                    chatHistoryLoaded = true;
+                    showNotification('AI生态顾问已就绪', 'ai');
+                    
+                    // 设置消息操作按钮
+                    setupMessageActions();
+                })
+                .catch(error => {
+                    console.error('加载聊天历史失败:', error);
+                    voiceStatus.textContent = '加载历史记录失败';
+                });
+        }
         
-        print(f"发送控制命令: {cmd}")
-        return cmd
+        // 通知函数
+        function showNotification(message, type = 'success') {
+            const notification = document.getElementById('notification');
+            const notificationText = document.querySelector('.notification-text');
+            
+            notificationText.textContent = message;
+            notification.className = `notification ${type === 'error' ? 'error' : type === 'ai' ? 'ai' : type === 'voice' ? 'voice' : ''}`;
+            notification.classList.add('show');
+            
+            setTimeout(() => {
+                notification.classList.remove('show');
+            }, 3000);
+        }
         
-    except Exception as e:
-        print(f"生成控制命令失败: {e}")
-        return "off"  # 出错时返回安全状态
-
-@socketio.on('connect')
-def handle_connect():
-    print('客户端连接')
-    emit('connection_status', {'status': 'connected', 'message': '已连接到生态监控系统'})
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    print('客户端断开连接')
-
-def simulate_sensor_data():
-    """模拟传感器数据（实际使用时由硬件提供）"""
-    return {
-        'temperature':22,
-        'humidity': 72,
-        'light_level': 842
-    }
-
-def control_hardware_ventilation(ventilation_on, speed):
-    """控制硬件通风系统 - 实际使用时连接硬件"""
-    print(f"【硬件控制】通风系统: {'开启' if ventilation_on else '关闭'}, 速度: {speed}%")
-
-def control_hardware_lighting(lighting_on, brightness):
-    """控制硬件照明系统 - 实际使用时连接硬件"""
-    print(f"【硬件控制】照明系统: {'开启' if lighting_on else '关闭'}, 亮度: {brightness}%")
-    # 向主控板发送命令
-    try:
-        print(f"发送命令到主控板: {'light_on' if lighting_on else 'off'}")
-    except Exception as e:
-        print(f"控制照明失败: {e}")
-
-if __name__ == '__main__':
-    # 设置硬件控制回调
-    eco_system.set_ventilation_callback(control_hardware_ventilation)
-    eco_system.set_lighting_callback(control_hardware_lighting)
-    eco_system.set_data_update_callback(simulate_sensor_data)
-    
-    # 启动后台线程
-    eco_system.start_background_thread()
-    
-    print("🚀 启动生态治理小能手监控系统...")
-    print("🌐 访问地址: http://localhost:8080")
-    print("🤖 DeepSeek大模型已集成，可进行生态治理咨询")
-    print("✅ 硬件接口已配置，可通过WiFi与主控板通信")
-    print("🌤️ 天气数据已集成，自动获取宁波市天气状况")
-    
-    # 启动Flask应用
-    socketio.run(app, host='0.0.0.0', port=8080, debug=True)
+        // 初始连接状态
+        if (socket.connected) {
+            document.getElementById('connection-status').textContent = '在线';
+            document.getElementById('connection-status').className = 'status-value good';
+        }
+        
+        // 页面加载完成后
+        window.addEventListener('load', function() {
+            document.getElementById('chat-message').focus();
+            
+            // 检查语音支持
+            checkVoiceSupport();
+            
+            // 模拟初始环境数据
+            const initialData = {
+                temperature: 25.5,
+                humidity: 65,
+                light_level: 850,
+                weather_condition: '晴',
+                weather_temperature: 22.0,
+                weather_humidity: 60,
+                weather_city: '宁波',
+                timestamp: new Date().toLocaleTimeString()
+            };
+            
+            const weatherData = {
+                condition: initialData.weather_condition,
+                temperature: initialData.weather_temperature,
+                humidity: initialData.weather_humidity,
+                city: initialData.weather_city
+            };
+            
+            // 更新天气UI
+            updateWeatherUI(weatherData);
+            
+            // 计算初始环境评分
+            const initialScoreData = calculateEnvironmentScore(initialData, weatherData);
+            updateEnvironmentBackground(initialScoreData);
+            
+            // 每30秒重新获取语音列表
+            setInterval(getVoices, 30000);
+        });
+        
+        // 页面卸载时停止语音
+        window.addEventListener('beforeunload', function() {
+            synth.cancel();
+            if (isListening) {
+                recognition.stop();
+            }
+        });
+    </script>
+</body>
+</html>
