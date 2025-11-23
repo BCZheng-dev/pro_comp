@@ -1,0 +1,390 @@
+# eco_dashboard.py
+from flask import Flask, render_template, jsonify, request
+from flask_socketio import SocketIO, emit
+import threading
+import time
+import random
+from datetime import datetime
+import openai
+import os
+import requests
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# 初始化DeepSeek客户端
+deepseek_client = openai.OpenAI(
+    base_url="https://api.deepseek.com",
+    api_key="sk-ce7cb4a9e8ad40fd97392a86379e41e5"  # DeepSeek API密钥
+)
+
+class EcoSystem:
+    def __init__(self):
+        self.temperature = 25.5
+        self.humidity = 65
+        self.light_level = 850
+        self.weather_condition = "晴"
+        self.weather_temperature = 22.0
+        self.weather_humidity = 60
+        self.weather_city = "宁波"
+        self.ventilation_active = False
+        self.ventilation_speed = 0
+        self.lighting_active = False
+        self.lighting_brightness = 0
+        self.running = True
+        self.chat_history = []  # 存储聊天历史
+        self.last_weather_update = None  # 记录上次天气更新的时间
+        
+        # 回调函数
+        self.ventilation_callback = None
+        self.lighting_callback = None
+        self.data_update_callback = None
+    
+    def start_background_thread(self):
+        """启动后台数据更新线程"""
+        def update_data():
+            while self.running:
+                # 降低天气API调用频率，每10分钟更新一次
+                if not self.last_weather_update or (datetime.now() - self.last_weather_update).total_seconds() > 600:
+                    weather_data = self.get_weather_data()
+                    if weather_data:
+                        self.weather_condition = weather_data.get('condition', self.weather_condition)
+                        self.weather_temperature = weather_data.get('temperature', self.weather_temperature)
+                        self.weather_humidity = weather_data.get('humidity', self.weather_humidity)
+                        self.weather_city = weather_data.get('city', self.weather_city)
+                        self.last_weather_update = datetime.now()
+                
+                # 广播数据更新
+                socketio.emit('sensor_data', {
+                    'temperature': round(self.temperature, 1),
+                    'humidity': round(self.humidity, 1),
+                    'light_level': round(self.light_level, 1),
+                    'weather_condition': self.weather_condition,
+                    'weather_temperature': round(self.weather_temperature, 1),
+                    'weather_humidity': round(self.weather_humidity, 1),
+                    'weather_city': self.weather_city,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+                
+                time.sleep(1)  # 每秒更新
+        
+        thread = threading.Thread(target=update_data, daemon=True)
+        thread.start()
+    
+    def get_weather_data(self):
+        """获取宁波市天气数据"""
+        try:
+            # 高德地图API参数
+            url = "https://restapi.amap.com/v3/weather/weatherInfo"
+            params = {
+                "key": "e43316c9feea1a2537aa004df7921c9e",  # 高德地图API密钥
+                "city": "330201",  # 宁波市市辖区adcode
+                "extensions": "base",  # base=实况天气
+                "output": "JSON"
+            }
+            
+            response = requests.get(url, params=params, timeout=5)
+            data = response.json()
+            
+            if data.get("status") == "1" and isinstance(data.get("lives"), list) and len(data["lives"]) > 0:
+                live = data["lives"][0]  # 确保正确访问列表中的第一个元素
+                return {
+                    'condition': live.get('weather', '未知'),
+                    'temperature': float(live.get('temperature', 22.0)),
+                    'humidity': int(live.get('humidity', 60)),
+                    'city': live.get('city', '未知'),
+                    'reporttime': live.get('reporttime', '')
+                }
+            else:
+                print("天气API返回错误:", data.get("info", "未知错误"))
+                return None
+                
+        except Exception as e:
+            print(f"获取天气数据失败: {e}")
+            # 返回模拟数据，确保系统继续运行
+            return {
+                'condition': "多云",
+                'temperature': 18,
+                'humidity': 68,
+                'city': "宁波"
+            }
+    
+    def set_ventilation_callback(self, callback):
+        """设置通风控制回调"""
+        self.ventilation_callback = callback
+    
+    def set_lighting_callback(self, callback):
+        """设置照明控制回调"""
+        self.lighting_callback = callback
+    
+    def set_data_update_callback(self, callback):
+        """设置数据更新回调"""
+        self.data_update_callback = callback
+    
+    def stop(self):
+        """停止系统"""
+        self.running = False
+    
+    def get_eco_context(self):
+        """获取当前生态系统的上下文信息"""
+        return {
+            'temperature': round(self.temperature, 1),
+            'humidity': round(self.humidity, 1),
+            'light_level': round(self.light_level, 1),
+            'weather_condition': self.weather_condition,
+            'weather_temperature': round(self.weather_temperature, 1),
+            'weather_humidity': round(self.weather_humidity, 1),
+            'weather_city': self.weather_city,
+            'ventilation_active': self.ventilation_active,
+            'ventilation_speed': self.ventilation_speed,
+            'lighting_active': self.lighting_active,
+            'lighting_brightness': self.lighting_brightness,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+# 创建生态系统实例
+eco_system = EcoSystem()
+
+# 路由
+@app.route('/')
+def index():
+    return render_template('dashboard.html')
+
+@app.route('/api/sensor_data', methods=['GET'])
+def get_sensor_data():
+    """获取传感器数据API"""
+    data = eco_system.get_eco_context()
+    return jsonify(data)
+
+@app.route('/api/control/ventilation', methods=['POST'])
+def control_ventilation():
+    """控制通风系统"""
+    data = request.get_json()
+    ventilation_on = data.get('ventilation_on')
+    speed = data.get('speed', 0)
+    
+    eco_system.ventilation_active = ventilation_on
+    eco_system.ventilation_speed = speed
+    
+    # 调用回调函数
+    if eco_system.ventilation_callback:
+        eco_system.ventilation_callback(ventilation_on, speed)
+    
+    return jsonify({
+        'success': True,
+        'message': f'通风控制: {"开启" if ventilation_on else "关闭"}, 速度: {speed}%'
+    })
+
+@app.route('/api/control/lighting', methods=['POST'])
+def control_lighting():
+    """控制照明系统"""
+    data = request.get_json()
+    lighting_on = data.get('lighting_on')
+    brightness = data.get('brightness', 0)
+    
+    eco_system.lighting_active = lighting_on
+    eco_system.lighting_brightness = brightness
+    
+    # 调用回调函数
+    if eco_system.lighting_callback:
+        eco_system.lighting_callback(lighting_on, brightness)
+    
+    return jsonify({
+        'success': True,
+        'message': f'照明控制: {"开启" if lighting_on else "关闭"}, 亮度: {brightness}%'
+    })
+
+@app.route('/api/chat', methods=['POST'])
+def chat_with_deepseek():
+    """与DeepSeek大模型聊天"""
+    try:
+        user_message = request.get_json().get('message', '').strip()
+        
+        if not user_message:
+            return jsonify({'error': '消息不能为空'}), 400
+        
+        # 获取当前生态系统上下文
+        eco_context = eco_system.get_eco_context()
+        
+        # 构建系统提示
+        system_prompt = f"""你是一位生态治理专家助手，专门帮助用户管理和监控微型生态室。
+当前生态室状态：
+- 室内温度: {eco_context['temperature']}°C (适宜范围: 20-30°C)
+- 室内湿度: {eco_context['humidity']}% (适宜范围: 40-80%)
+- 室内光照: {eco_context['light_level']} lux (适宜范围: 500-2000 lux)
+- 宁波市室外天气: {eco_context['weather_condition']}
+- 室外温度: {eco_context['weather_temperature']}°C
+- 室外湿度: {eco_context['weather_humidity']}%
+- 通风系统: {'开启' if eco_context['ventilation_active'] else '关闭'}, 速度: {eco_context['ventilation_speed']}%
+- 照明系统: {'开启' if eco_context['lighting_active'] else '关闭'}, 亮度: {eco_context['lighting_brightness']}%
+请根据当前状态和室外天气提供专业建议，帮助用户优化生态室环境。你可以：
+1. 分析当前环境参数是否在适宜范围内
+2. 根据室外天气建议调整通风、照明等控制参数
+3. 解释自然天气对室内生态的影响
+4. 提供生物多样性保护建议
+5. 回答生态治理相关问题
+请用中文回复，保持专业但易懂的语气。"""
+        
+        # 准备消息历史
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+        
+        # 调用DeepSeek API
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=500,
+            stream=False
+        )
+        
+        ai_response = response.choices[0].message.content.strip()
+        
+        # 保存到聊天历史
+        eco_system.chat_history.append({
+            'user': user_message,
+            'ai': ai_response,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        })
+        
+        # 保留最近10条对话
+        if len(eco_system.chat_history) > 10:
+            eco_system.chat_history = eco_system.chat_history[-10:]
+        
+        return jsonify({
+            'success': True,
+            'response': ai_response,
+            'context': eco_context
+        })
+    
+    except Exception as e:
+        print(f"DeepSeek API错误: {e}")
+        return jsonify({
+            'success': False,
+            'error': '与DeepSeek通信失败，请稍后再试',
+            'details': str(e)
+        }), 500
+
+@app.route('/api/chat/history')
+def get_chat_history():
+    """获取聊天历史"""
+    return jsonify({
+        'history': eco_system.chat_history,
+        'context': eco_system.get_eco_context()
+    })
+
+@app.route('/input', methods=['GET'])
+def receive_sensor_data():
+    """接收来自主控板的传感器数据 - 硬件接口"""
+    try:
+        # 从请求参数获取传感器数据
+        temp = request.args.get('temp')
+        hum = request.args.get('hum')
+        light = request.args.get('light')
+        
+        if temp is not None and hum is not None and light is not None:
+            # 更新内部状态
+            eco_system.temperature = float(temp)
+            eco_system.humidity = float(hum)
+            eco_system.light_level = int(light)
+            
+            print(f"收到传感器数据：温度={temp}℃, 湿度={hum}%, 光照={light}Lux")
+            
+            # 通过WebSocket广播更新
+            socketio.emit('sensor_data', {
+                'temperature': round(eco_system.temperature, 1),
+                'humidity': round(eco_system.humidity, 1),
+                'light_level': round(eco_system.light_level, 1),
+                'weather_condition': eco_system.weather_condition,
+                'weather_temperature': round(eco_system.weather_temperature, 1),
+                'weather_humidity': round(eco_system.weather_humidity, 1),
+                'weather_city': eco_system.weather_city,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            })
+            
+            return "OK"
+        else:
+            return "Error: Missing parameters", 400
+            
+    except Exception as e:
+        print(f"处理传感器数据失败: {e}")
+        return f"Error: {str(e)}", 500
+
+@app.route('/command', methods=['GET'])
+def get_command():
+    """向主控板发送控制命令 - 硬件接口"""
+    try:
+        # 根据当前系统状态决定命令
+        cmd = "off"  # 默认关闭
+        
+        # 如果通风系统开启，发送开启命令
+        if eco_system.ventilation_active and eco_system.ventilation_speed > 0:
+            cmd = "vent_on"
+        # 如果照明系统开启，发送开启命令
+        elif eco_system.lighting_active:
+            cmd = "light_on"
+        # 如果两者都关闭，发送关闭命令
+        else:
+            cmd = "off"
+        
+        print(f"发送控制命令: {cmd}")
+        return cmd
+        
+    except Exception as e:
+        print(f"生成控制命令失败: {e}")
+        return "off"  # 出错时返回安全状态
+
+@socketio.on('connect')
+def handle_connect():
+    print('客户端连接')
+    emit('connection_status', {'status': 'connected', 'message': '已连接到生态监控系统'})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('客户端断开连接')
+
+def simulate_sensor_data():
+    """模拟传感器数据（实际使用时由硬件提供）"""
+    return {
+        'temperature':22,
+        'humidity': 72,
+        'light_level': 842
+    }
+
+def control_hardware_ventilation(ventilation_on, speed):
+    """控制硬件通风系统 - 实际使用时连接硬件"""
+    print(f"【硬件控制】通风系统: {'开启' if ventilation_on else '关闭'}, 速度: {speed}%")
+
+def control_hardware_lighting(lighting_on, brightness):
+    """控制硬件照明系统 - 实际使用时连接硬件"""
+    print(f"【硬件控制】照明系统: {'开启' if lighting_on else '关闭'}, 亮度: {brightness}%")
+    # 向主控板发送命令
+    try:
+        print(f"发送命令到主控板: {'light_on' if lighting_on else 'off'}")
+    except Exception as e:
+        print(f"控制照明失败: {e}")
+
+if __name__ == '__main__':
+    # 设置硬件控制回调
+    eco_system.set_ventilation_callback(control_hardware_ventilation)
+    eco_system.set_lighting_callback(control_hardware_lighting)
+    eco_system.set_data_update_callback(simulate_sensor_data)
+    
+    # 启动后台线程
+    eco_system.start_background_thread()
+    
+    print("🚀 启动生态治理小能手监控系统...")
+    print("🌐 访问地址: http://localhost:8080")
+    print("🤖 DeepSeek大模型已集成，可进行生态治理咨询")
+    print("✅ 硬件接口已配置，可通过WiFi与主控板通信")
+    print("🌤️ 天气数据已集成，自动获取宁波市天气状况")
+    
+    # 启动Flask应用
+    socketio.run(app, host='0.0.0.0', port=8080, debug=True)
